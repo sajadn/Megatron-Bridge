@@ -21,7 +21,6 @@ from megatron.core.transformer.module import MegatronModule
 
 from megatron.bridge.training.config import SchedulerConfig
 
-
 def setup_optimizer(
     optimizer_config: OptimizerConfig,
     scheduler_config: SchedulerConfig,
@@ -45,14 +44,24 @@ def setup_optimizer(
     Returns:
         tuple containing the optimizer and scheduler
     """
-    optimizer = get_megatron_optimizer(
-        optimizer_config,
-        model,
-        no_weight_decay_cond,
-        scale_lr_cond,
-        lr_mult,
-        use_gloo_process_groups=use_gloo_process_groups,
-    )
+    # check if optimizer_config has a provide method
+    if hasattr(optimizer_config, 'provide'):
+        optimizer = optimizer_config.provide(
+            model,
+            no_weight_decay_cond=no_weight_decay_cond,
+            scale_lr_cond=scale_lr_cond,
+            lr_mult=lr_mult,
+            use_gloo_process_groups=use_gloo_process_groups,
+        )
+    else:
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            model,
+            no_weight_decay_cond,
+            scale_lr_cond,
+            lr_mult,
+            use_gloo_process_groups=use_gloo_process_groups,
+        )
     scheduler = _get_scheduler(optimizer_config, scheduler_config, optimizer)
 
     return optimizer, scheduler
