@@ -18,9 +18,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVAL_SCRIPT="${SCRIPT_DIR}/eval_megatron.sh"
 
-# --- Checkpoint paths (Megatron Bridge format, converted by this repo) ---
-CKPT_3B="${CKPT_3B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/cascade_mb/ministral_3b}"
-CKPT_8B="${CKPT_8B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/cascade_mb/ministral_8b}"
+# --- Checkpoint paths (Megatron Bridge format, must point to iter_* subdir) ---
+CKPT_3B="${CKPT_3B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/cascade_mb/ministral_3b/iter_0000000}"
+CKPT_8B="${CKPT_8B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/cascade_mb/ministral_8b/iter_0000000}"
 
 # HF model IDs for config loading (AutoBridge) — must point to actual config.json dirs
 HF_3B="${HF_3B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/ministral_3b/iter_0012500_hf/Ministral-3-3B-Base-2512_converted}"
