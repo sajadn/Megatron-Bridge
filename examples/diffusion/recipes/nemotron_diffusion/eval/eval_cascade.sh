@@ -22,9 +22,9 @@ EVAL_SCRIPT="${SCRIPT_DIR}/eval_megatron.sh"
 CKPT_3B="${CKPT_3B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/cascade_mb/ministral_3b}"
 CKPT_8B="${CKPT_8B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/cascade_mb/ministral_8b}"
 
-# HF model IDs for config loading (AutoBridge)
-HF_3B="${HF_3B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/ministral_3b/iter_0012500_hf}"
-HF_8B="${HF_8B:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/abhgarg/megatron_exp/ministral_8b_sbd64_llada_combine_before_weighting_1e_5_rerun_32/iter_0012500_hf}"
+# HF model IDs for config loading (AutoBridge) — must point to actual config.json dirs
+HF_3B="${HF_3B:-/lustre/fsw/portfolios/coreai/users/snorouzi/megatron_exp/ministral_3b/iter_0012500_hf/Ministral-3-3B-Base-2512_converted}"
+HF_8B="${HF_8B:-/lustre/fsw/portfolios/nvr/projects/nvr_lpr_llm/users/abhgarg/megatron_exp/ministral_8b_sbd64_llada_combine_before_weighting_1e_5_rerun_32/iter_0012500_hf/Ministral-3-8B-Base-2512_1t_ft}"
 
 # --- Parse args ---
 EXEC_MODE=""
