@@ -109,6 +109,10 @@ while [[ $# -gt 0 ]]; do
       DENOISING_THRESHOLD="$2"; shift 2 ;;
     --limit)
       LIMIT="$2"; shift 2 ;;
+    --cascade-schedule)
+      CASCADE_SCHEDULE="$2"; shift 2 ;;
+    --latency-log-path)
+      LATENCY_LOG_PATH_PREFIX="$2"; shift 2 ;;
     *)
       echo "Unknown option: $1"
       echo "Usage: $0 [--direct|--parallel-tasks|--parallel-models] [--expts E1,E2] [--modes dllm,ar] [--eval-tasks T1,T2] [--seeds S1,S2] [--gpus N]"
@@ -317,6 +321,15 @@ build_eval_command() {
     MODEL_ARGS="${MODEL_ARGS},tp=${tp},pp=1"
     MODEL_ARGS="${MODEL_ARGS},nfe_log_path=${nfe_log}"
     MODEL_ARGS="${MODEL_ARGS},load_hf_weights=False"
+    if [ -n "${CASCADE_SCHEDULE:-}" ]; then
+        MODEL_ARGS="${MODEL_ARGS},cascade_schedule=${CASCADE_SCHEDULE}"
+    fi
+
+    local latency_log="${output_path}__latency.json"
+    if [ -n "${LATENCY_LOG_PATH_PREFIX:-}" ]; then
+        latency_log="${LATENCY_LOG_PATH_PREFIX}/${exp_name}/seed_${seed}/${task}-ns${nshot}__latency.json"
+    fi
+    MODEL_ARGS="${MODEL_ARGS},latency_log_path=${latency_log}"
 
     local LIMIT_ARG=""
     if [ -n "${LIMIT}" ]; then

@@ -251,6 +251,7 @@ def build_and_load_model(
     return_state_dict: bool = False,
     use_cpu_init: bool = False,
     skip_temp_dist_context: Optional[bool] = None,
+    dist_ckpt_strictness: str = "assume_ok_unexpected",
 ) -> Union[Any, dict[str, torch.Tensor]]:
     """Load a Megatron model from a distributed checkpoint.
 
@@ -352,7 +353,8 @@ def build_and_load_model(
             load_modelopt_state(model, checkpoint_path)
 
         maybe_state_dict = _load_model_weights_from_checkpoint(
-            checkpoint_path, model, return_state_dict=return_state_dict
+            checkpoint_path, model, return_state_dict=return_state_dict,
+            dist_ckpt_strictness=dist_ckpt_strictness,
         )
 
         if return_state_dict:

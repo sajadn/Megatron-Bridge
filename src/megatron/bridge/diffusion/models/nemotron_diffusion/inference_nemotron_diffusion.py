@@ -28,6 +28,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from typing import Optional
+
 
 # ---------------------------------------------------------------------------
 # Helpers (ported from the original eval.py)
@@ -286,6 +288,7 @@ def generate_dllm(
     threshold: float = None,
     shift_logits: bool = True,
     neg_entropy: bool = True,
+    model_schedule: Optional[list] = None,
 ):
     """Block-diffusion generation with prefix KV cache.
 
@@ -321,6 +324,21 @@ def generate_dllm(
     assert steps % num_blocks == 0
     steps_per_block = steps // num_blocks
 
+    # --- Expand model_schedule into a per-step list ---
+    if model_schedule is not None:
+        _step_models = []
+        for sched_model, sched_steps in model_schedule:
+            _step_models.extend([sched_model] * sched_steps)
+        if len(_step_models) != steps_per_block:
+            raise ValueError(
+                f"model_schedule total steps ({len(_step_models)}) != "
+                f"steps_per_block ({steps_per_block})"
+            )
+        for sched_model, _ in model_schedule:
+            _set_inference_mode(sched_model, True)
+    else:
+        _step_models = None
+
     nfe = 0
     _t_prefill_ms = 0.0
     _t_denoise_ms = 0.0
@@ -336,6 +354,18 @@ def generate_dllm(
     logits = _model_forward(model, prompt)  # [b, prompt_len, V]
     torch.cuda.synchronize()
     _t_prefill_ms += (time.perf_counter() - _t0) * 1000.0
+
+    # Prefill each unique cascade model so they have prompt context in their KV cache
+    if model_schedule is not None:
+        _unique_sched_models = list(dict.fromkeys(m for m, _ in model_schedule))
+        for sched_model in _unique_sched_models:
+            _set_inference_params(sched_model, causal=True, cache_enabled=True)
+            _clear_kv_cache(sched_model)
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            _model_forward(sched_model, prompt)
+            torch.cuda.synchronize()
+            _t_prefill_ms += (time.perf_counter() - _t0) * 1000.0
 
     next_logits_context = None
     if dream_style:
@@ -359,15 +389,16 @@ def generate_dllm(
 
         # --- Denoise the block iteratively ---
         for i in range(steps_per_block):
+            step_model = _step_models[i] if _step_models is not None else model
             mask_block_idx = x_accum[:, block_slice] == mask_id
             if mask_block_idx.sum() == 0:
                 break
 
             nfe += 1
-            _set_inference_params(model, causal=False, cache_enabled=False)
+            _set_inference_params(step_model, causal=False, cache_enabled=False)
             torch.cuda.synchronize()
             _t0 = time.perf_counter()
-            logits_block = _model_forward(model, x_accum[:, block_slice])  # [b, block_length, V]
+            logits_block = _model_forward(step_model, x_accum[:, block_slice])  # [b, block_length, V]
             torch.cuda.synchronize()
             _t_denoise_ms += (time.perf_counter() - _t0) * 1000.0
 
@@ -408,17 +439,38 @@ def generate_dllm(
                 x_accum[:, block_slice] = cur
 
         # --- After block is denoised, update KV cache with the clean block ---
-        _set_inference_params(model, causal=True, cache_enabled=True)
-        torch.cuda.synchronize()
-        _t0 = time.perf_counter()
-        output_logits = _model_forward(model, x_accum[:, block_slice])  # [b, block_length, V]
-        torch.cuda.synchronize()
-        _t_kv_update_ms += (time.perf_counter() - _t0) * 1000.0
+        if model_schedule is not None:
+            kv_update_models = _unique_sched_models
+        else:
+            kv_update_models = [model]
+
+        output_logits = None
+        for kv_model in kv_update_models:
+            _set_inference_params(kv_model, causal=True, cache_enabled=True)
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            _logits = _model_forward(kv_model, x_accum[:, block_slice])
+            torch.cuda.synchronize()
+            _t_kv_update_ms += (time.perf_counter() - _t0) * 1000.0
+            if kv_model is model:
+                output_logits = _logits
+
+        # Primary model always needs KV update too (for next_logits_context)
+        if model_schedule is not None and output_logits is None:
+            _set_inference_params(model, causal=True, cache_enabled=True)
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            output_logits = _model_forward(model, x_accum[:, block_slice])
+            torch.cuda.synchronize()
+            _t_kv_update_ms += (time.perf_counter() - _t0) * 1000.0
 
         if dream_style and num_block < num_blocks - 1:
             next_logits_context = output_logits[:, -1:, :]
 
     _set_inference_mode(model, False)
+    if model_schedule is not None:
+        for sched_model, _ in model_schedule:
+            _set_inference_mode(sched_model, False)
     _timing = {
         "prefill_ms": _t_prefill_ms,
         "denoise_ms": _t_denoise_ms,

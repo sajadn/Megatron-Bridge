@@ -134,6 +134,7 @@ def _load_cascade_schedule(cascade_schedule, model_provider, hf_model_id, tp, pp
             checkpoint_path=ckpt_path,
             model_cfg=sched_provider,
             skip_temp_dist_context=True,
+            dist_ckpt_strictness="ignore_all",
         )
         if isinstance(sched_megatron_models, list):
             sched_model = sched_megatron_models[0].cuda().eval()
@@ -316,6 +317,7 @@ class MegatronDLLM(LM):
                 checkpoint_path=megatron_load_path,
                 model_cfg=model_provider,
                 skip_temp_dist_context=True,
+            dist_ckpt_strictness="ignore_all",
             )
         if isinstance(megatron_models, list):
             self.model = megatron_models[0].cuda().eval()
@@ -469,6 +471,7 @@ class MegatronDLLM(LM):
                 threshold=self.denoising_threshold,
                 shift_logits=self.shift_logits,
                 neg_entropy=self.neg_entropy,
+                model_schedule=self.model_schedule,
             )
         torch.cuda.synchronize()
         _latency_ms = (time.perf_counter() - _t_gen_start) * 1000.0
