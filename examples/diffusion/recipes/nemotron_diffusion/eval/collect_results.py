@@ -231,7 +231,41 @@ def collect_experiment(exp_name, base_dir=BASE_DIR, postprocess=True):
         else:
             exp_results[task_name] = {m: None for m in config["metrics"]}
 
+    # Collect latency data
+    latency = {}
+    for task_name in TASK_CONFIGS:
+        lat = collect_latency(exp_dir, task_name)
+        if lat:
+            latency[task_name] = lat
+    if latency:
+        exp_results["_latency"] = latency
+
     return exp_results
+
+
+def collect_latency(exp_dir, task_name):
+    """Collect per-phase latency stats from __latency.json files."""
+    latency_file = os.path.join(exp_dir, task_name + "__latency.json")
+    if not os.path.exists(latency_file):
+        return None
+    try:
+        with open(latency_file) as f:
+            data = json.load(f)
+        if not data:
+            return None
+        has_phases = "prefill_ms" in data[0]
+        n = len(data)
+        avg = lambda key: sum(d.get(key, 0) for d in data) / n
+        result = {"latency_ms": avg("latency_ms"), "ms_per_token": avg("ms_per_token"), "n_samples": n}
+        if has_phases:
+            result["prefill_ms"] = avg("prefill_ms")
+            result["denoise_ms"] = avg("denoise_ms")
+            result["kv_update_ms"] = avg("kv_update_ms")
+            result["overhead_ms"] = avg("overhead_ms")
+        return result
+    except Exception as e:
+        print(f"  Warning: failed to read latency from {latency_file}: {e}")
+        return None
 
 
 def fmt(v):
@@ -250,6 +284,12 @@ def print_table(all_results, csv=False):
                 metric_name = m.split(',')[0]
                 suffix = m.split(',')[1] if ',' in m else ''
                 headers.append(f"{short}_{metric_name}_{suffix}" if suffix else f"{short}_{metric_name}")
+    headers.append("avg_latency_ms")
+    headers.append("avg_ms_per_token")
+    headers.append("prefill_ms")
+    headers.append("denoise_ms")
+    headers.append("kv_update_ms")
+    headers.append("overhead_ms")
     print(sep.join(headers))
 
     for r in all_results:
@@ -264,6 +304,24 @@ def print_table(all_results, csv=False):
             else:
                 for m in config["metrics"]:
                     row.append(fmt(tr.get(m)))
+        # Aggregate latency across tasks
+        lat_data = r.get("_latency", {})
+        if lat_data:
+            all_lat = [v for v in lat_data.values()]
+            avg_lat = sum(v["latency_ms"] for v in all_lat) / len(all_lat)
+            avg_mpt = sum(v["ms_per_token"] for v in all_lat) / len(all_lat)
+            has_phases = "prefill_ms" in all_lat[0]
+            row.append(f"{avg_lat:.1f}")
+            row.append(f"{avg_mpt:.3f}")
+            if has_phases:
+                row.append(f"{sum(v["prefill_ms"] for v in all_lat)/len(all_lat):.1f}")
+                row.append(f"{sum(v["denoise_ms"] for v in all_lat)/len(all_lat):.1f}")
+                row.append(f"{sum(v["kv_update_ms"] for v in all_lat)/len(all_lat):.1f}")
+                row.append(f"{sum(v["overhead_ms"] for v in all_lat)/len(all_lat):.1f}")
+            else:
+                row.extend(["N/A"] * 4)
+        else:
+            row.extend(["N/A"] * 6)
         print(sep.join(row))
 
 
