@@ -497,7 +497,7 @@ class MegatronDLLM(LM):
             }
         )
         if self.latency_log_path:
-            self._log_latency(_latency_ms, prompt_ids.shape[0], self.max_new_tokens)
+            self._log_latency(_latency_ms, prompt_ids.shape[0], self.max_new_tokens, _timing)
 
         return [tokenized_out]
 
@@ -518,7 +518,7 @@ class MegatronDLLM(LM):
         except Exception as e:
             eval_logger.warning(f"Failed to log NFE: {e}")
 
-    def _log_latency(self, latency_ms: float, batch_size: int, tokens_generated: int):
+    def _log_latency(self, latency_ms: float, batch_size: int, tokens_generated: int, timing: dict = None):
         try:
             os.makedirs(os.path.dirname(self.latency_log_path), exist_ok=True)
             if os.path.exists(self.latency_log_path):
@@ -529,14 +529,18 @@ class MegatronDLLM(LM):
                     log_data = []
             else:
                 log_data = []
-            log_data.append(
-                {
-                    "latency_ms": latency_ms,
-                    "batch_size": batch_size,
-                    "tokens_generated": tokens_generated,
-                    "ms_per_token": latency_ms / (batch_size * tokens_generated),
-                }
-            )
+            entry = {
+                "latency_ms": latency_ms,
+                "batch_size": batch_size,
+                "tokens_generated": tokens_generated,
+                "ms_per_token": latency_ms / (batch_size * tokens_generated),
+            }
+            if timing:
+                entry["prefill_ms"] = timing.get("prefill_ms", 0.0)
+                entry["denoise_ms"] = timing.get("denoise_ms", 0.0)
+                entry["kv_update_ms"] = timing.get("kv_update_ms", 0.0)
+                entry["overhead_ms"] = latency_ms - entry["prefill_ms"] - entry["denoise_ms"] - entry["kv_update_ms"]
+            log_data.append(entry)
             with open(self.latency_log_path, "w") as f:
                 json.dump(log_data, f)
         except Exception as e:
