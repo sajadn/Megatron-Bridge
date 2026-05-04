@@ -53,6 +53,7 @@ from megatron.bridge.diffusion.conversion.nemotron_diffusion.nemotron_diffusion_
 from megatron.bridge.diffusion.models.nemotron_diffusion.inference_nemotron_diffusion import (
     generate_ar,
     generate_dllm,
+    generate_dLLM_AR_justGRPO,
     set_tp_group,
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
@@ -83,9 +84,16 @@ def parse_args():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["dllm", "ar"],
+        choices=["dllm", "ar", "dllm_ar"],
         default="dllm",
-        help="Generation mode: 'dllm' for block diffusion (default), 'ar' for autoregressive",
+        help="Generation mode: 'dllm' for block diffusion (default), 'ar' for autoregressive, "
+        "'dllm_ar' for JustGRPO AR rollout from dLLM",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Print per-step denoising output (dllm_ar mode only)",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -219,6 +227,17 @@ def main():
                 temperature=args.temperature,
                 eos_token_id=tokenizer.eos_token_id,
             )
+        elif args.mode == "dllm_ar":
+            output, _ = generate_dLLM_AR_justGRPO(
+                model=model,
+                prompt=prompt_ids,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                mask_id=args.mask_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                tokenizer=tokenizer,
+                DEBUG=args.debug,
+            )
         else:
             output, nfe, _ = generate_dllm(
                 model=model,
@@ -234,7 +253,8 @@ def main():
 
     # Decode and print (rank 0 only)
     if rank == 0 or (args.tp > 1 and rank % args.tp == 0):
-        generated_ids = output[:, prompt_len:]
+        # dllm_ar returns only the generated tokens; ar/dllm return the full sequence
+        generated_ids = output if args.mode == "dllm_ar" else output[:, prompt_len:]
         texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         for i, (prompt, text) in enumerate(zip(args.prompts, texts)):
             print(f"\n--- Prompt {i + 1} ---")

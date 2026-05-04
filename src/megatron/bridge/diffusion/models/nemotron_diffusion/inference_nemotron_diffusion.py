@@ -269,6 +269,148 @@ def generate_ar(
 
 
 # ---------------------------------------------------------------------------
+# dLLM-AR (JustGRPO) generation
+# ---------------------------------------------------------------------------
+
+
+def _debug_print_step(k, max_new_tokens, next_token_id, x, prompt_len, mask_id, tokenizer):
+    """Print the current denoising state for one batch item (index 0)."""
+    is_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    if not is_rank0:
+        return
+
+    gen_ids = x[0, prompt_len:].tolist()
+
+    if tokenizer is not None:
+        sampled_str = repr(tokenizer.decode([next_token_id]))
+        decoded = []
+        for tid in gen_ids:
+            decoded.append("▓" if tid == mask_id else tokenizer.decode([tid]))
+        before = "".join(decoded[:k])
+        after = "".join(decoded[: k + 1])
+        print(
+            f"[dLLM-AR step {k + 1:>{len(str(max_new_tokens))}}/{max_new_tokens}]"
+            f"  sampled: {sampled_str:<12}"
+            f'  |  partial: "{before}{"▓" * (max_new_tokens - k)}"'
+            f'  ->  "{after}{"▓" * (max_new_tokens - k - 1)}"'
+        )
+    else:
+        before_ids = [tid if tid != mask_id else -1 for tid in gen_ids[:k]]
+        print(
+            f"[dLLM-AR step {k + 1:>{len(str(max_new_tokens))}}/{max_new_tokens}]"
+            f"  sampled token_id={next_token_id}"
+            f"  |  ids so far: {before_ids + [next_token_id]}"
+        )
+
+
+@torch.no_grad()
+def generate_dLLM_AR_justGRPO(
+    model,
+    prompt: torch.Tensor,
+    max_new_tokens: int = 128,
+    temperature: float = 1.0,
+    mask_id: int = 100,
+    eos_token_id: int = None,
+    tokenizer=None,
+    DEBUG: bool = False,
+):
+    """AR rollout from a masked diffusion LM (JustGRPO algorithm).
+
+    At each step k, the input is [prompt | o1..o{k-1} | MASK..MASK].
+    Full bidirectional attention is used so the model sees all future masks.
+    Only the logit at position k is used to sample the next token — all
+    future-position logits are discarded.  This turns the dLLM into a
+    standard left-to-right AR policy without any architectural changes,
+    enabling GRPO to be applied directly.
+
+    Args:
+        model: Megatron GPTModel on CUDA.
+        prompt: [batch, prompt_len] token ids.
+        max_new_tokens: maximum number of tokens to generate.
+        temperature: sampling temperature (0 = greedy).
+        mask_id: mask token id used to fill future positions.
+        eos_token_id: stop when all batch items produce this token.
+        tokenizer: HF tokenizer for DEBUG decoding; if None, prints token ids.
+        DEBUG: print the partial output at every step when True.
+
+    Returns:
+        generated: [batch, max_new_tokens] generated token ids (tail may be
+            padding / eos if generation stopped early).
+        log_probs: [batch, steps_taken] per-token log-probabilities.
+    """
+    _set_inference_mode(model, True)
+
+    _, prompt_len = prompt.shape
+    device = prompt.device
+
+    # Prefill: encode prompt with causal attention and cache its K/V.
+    # This matches training distribution (prefix is always causal) and lets
+    # the generation region attend to prompt context via the KV cache.
+    # NemotronDiffusion is next-token prediction (shift-style): logit at
+    # position k predicts token k+1.  The causal prefill's last logit
+    # therefore predicts gen[0].
+    _set_inference_params(model, causal=True, cache_enabled=True)
+    _clear_kv_cache(model)
+    prefill_logits = _model_forward(model, prompt)  # [b, prompt_len, V]
+    prev_logit = prefill_logits[:, -1, :]  # [b, V] — predicts gen[0]
+
+    # Generation region starts as all masks: [b, max_new_tokens]
+    # We only ever feed this region to the model (not the prompt again).
+    x = torch.full((prompt.shape[0], max_new_tokens), mask_id, dtype=prompt.dtype, device=device)
+
+    log_probs_list = []
+
+    # From here: bidirectional attention over the generation region.
+    # The KV cache holds the prompt, so generation tokens attend to it too.
+    # cache_enabled=False: prompt K/V stays in cache but is never extended.
+    _set_inference_params(model, causal=False, cache_enabled=False)
+
+    for k in range(max_new_tokens):
+        # prev_logit is the shifted prediction for gen[k]:
+        #   k=0 : from last causal-prefill position (predicts gen[0])
+        #   k>0 : logits[:, k-1, :] from previous step's forward, where
+        #          x[:, k-1] was already unmasked to gen[k-1]
+        next_logits = prev_logit  # [b, V]
+
+        if temperature == 0:
+            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)  # [b, 1]
+            logp = F.log_softmax(next_logits, dim=-1).gather(-1, next_token)
+        else:
+            probs = F.softmax(next_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [b, 1]
+            logp = torch.log(probs).gather(-1, next_token)
+
+        x[:, k] = next_token.squeeze(-1)
+        log_probs_list.append(logp)
+
+        if DEBUG:
+            _debug_print_step(
+                k,
+                max_new_tokens,
+                next_token[0, 0].item(),
+                torch.cat([prompt, x], dim=1),
+                prompt_len,
+                mask_id,
+                tokenizer,
+            )
+
+        if eos_token_id is not None and (next_token == eos_token_id).all():
+            break
+
+        if k < max_new_tokens - 1:
+            # Forward with x = [gen[0..k], MASK..MASK].
+            # logits[:, k, :] is the shift-style prediction for gen[k+1]:
+            # position k is now gen[k] (just unmasked), so the model's output
+            # at k predicts the next token (k+1) given full bidirectional context.
+            logits = _model_forward(model, x)  # [b, max_new_tokens, V]
+            prev_logit = logits[:, k, :]  # [b, V] — predicts gen[k+1]
+
+    _set_inference_mode(model, False)
+    log_probs = torch.cat(log_probs_list, dim=1)  # [b, steps_taken]
+    return x, log_probs
+
+
+# ---------------------------------------------------------------------------
 # dLLM (Block Diffusion) generation
 # ---------------------------------------------------------------------------
 
