@@ -194,6 +194,7 @@ class NemotronLabsDiffusionAttention(MegatronModule):
 
         # RoPE setup (always required)
         hf_text_config = getattr(config.hf_config, "text_config", config.hf_config)
+        rope_parameters = hf_text_config.rope_parameters
         hf_text_config.max_position_embeddings = config.seq_length
         self.rope_embedding_module = Ministral3RotaryEmbedding(hf_text_config)
 
@@ -201,19 +202,20 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         self.beta = None
         self.max_position_embeddings = None
         if getattr(config, "apply_llama4_style_query_key_layer_scaling", False):
-            self.beta = hf_text_config.rope_parameters["llama_4_scaling_beta"]
-            self.max_position_embeddings = hf_text_config.rope_parameters["original_max_position_embeddings"]
+            self.beta = rope_parameters["llama_4_scaling_beta"]
+            self.max_position_embeddings = rope_parameters["original_max_position_embeddings"]
             if (
                 hasattr(config, "yarn_rotary_scaling_factor")
-                and config.yarn_rotary_scaling_factor != hf_text_config.rope_parameters["factor"]
+                and config.yarn_rotary_scaling_factor != rope_parameters["factor"]
             ):
+                rope_parameters["factor"] = config.yarn_rotary_scaling_factor
                 hf_text_config.rope_parameters["factor"] = config.yarn_rotary_scaling_factor
 
-        # Pre-compute the sbd_block_diff block mask
-        self.mask = compute_block_mask(
-            block_size=getattr(config, "block_size", 16),
-            max_seq_length=config.seq_length,
-        )
+        # Build sbd_block_diff block masks lazily. AR forwards use inference mode
+        # and should not allocate diffusion-only masks during module construction.
+        self.block_size = getattr(config, "block_size", 16)
+        self.mask_seq_length = config.seq_length
+        self._mask_cache = {}
 
         import torch._dynamo.config as dcfg
 
@@ -287,8 +289,14 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         key = repeat_kv(key, n_rep)
         value = repeat_kv(value, n_rep)
 
-        # NemotronLabsDiffusionAttention with pre-computed block mask
-        context = fused_flex_attention(query, key, value, block_mask=self.mask)
+        # NemotronLabsDiffusionAttention with a block mask matching this microbatch length
+        full_seq_len = query.shape[2]
+        block_mask = self._mask_cache.get(full_seq_len)
+        if block_mask is None:
+            block_mask = compute_block_mask(block_size=self.block_size, max_seq_length=self.mask_seq_length)
+            self._mask_cache[full_seq_len] = block_mask
+
+        context = fused_flex_attention(query, key, value, block_mask=block_mask)
 
         # Dropout
         if not self.config.sequence_parallel:

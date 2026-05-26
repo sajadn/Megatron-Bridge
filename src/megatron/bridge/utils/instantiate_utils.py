@@ -38,6 +38,7 @@ _ALLOWED_TARGET_PREFIXES: set[str] = {
     "torch.",
     "nvidia.",
     "transformers.",
+    "transformers_modules.",
     "numpy.",
     "nemo.",
 }
