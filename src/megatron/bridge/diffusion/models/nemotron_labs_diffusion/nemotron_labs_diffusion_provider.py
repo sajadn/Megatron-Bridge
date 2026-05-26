@@ -18,8 +18,8 @@ import inspect
 from dataclasses import dataclass
 
 from megatron.bridge.diffusion.models.common.nemotron_labs_diffusion_attention import NemotronLabsDiffusionAttention
-from megatron.bridge.models import Ministral3ModelProvider
 from megatron.bridge.models.gpt_provider import ModuleSpec
+from megatron.bridge.models.ministral3.ministral3_provider import Ministral3ModelProvider
 
 
 @dataclass

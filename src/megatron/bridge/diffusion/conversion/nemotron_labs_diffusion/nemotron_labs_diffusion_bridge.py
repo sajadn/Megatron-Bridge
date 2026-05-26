@@ -59,6 +59,10 @@ class NemotronLabsDiffusionBridge(MegatronModelBridge):
         # Auto-detect checkpoint format: VLM configs nest text params under text_config
         self._is_text_only = not hasattr(hf_config, "text_config")
 
+        rope_parameters = getattr(text_config, "rope_parameters", None)
+        if rope_parameters is not None and "rope_scaling" not in text_config.to_dict():
+            text_config.__dict__["rope_scaling"] = dict(rope_parameters)
+
         return NemotronLabsDiffusionModelProvider(
             hidden_size=text_config.hidden_size,
             ffn_hidden_size=text_config.intermediate_size,
