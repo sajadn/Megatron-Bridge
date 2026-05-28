@@ -71,6 +71,7 @@ class NemotronLabsDiffusionBridge(MegatronModelBridge):
             rotary_base=text_config.rope_parameters["rope_theta"],
             vocab_size=text_config.vocab_size,
             hf_config=hf_config,
+            block_size=getattr(text_config, "block_size", getattr(hf_config, "block_size", 64)),
         )
 
     def _text_only_mappings(self) -> list:

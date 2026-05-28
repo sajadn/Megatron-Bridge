@@ -31,7 +31,10 @@ from torch import Tensor
 from torch.nn.attention.flex_attention import flex_attention
 from transformers import ROPE_INIT_FUNCTIONS
 
-from megatron.bridge.diffusion.common.dllm import compute_block_mask
+from megatron.bridge.diffusion.common.dllm import (
+    compute_active_block_bidirectional_mask,
+    compute_block_mask,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +204,10 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         # Llama-4 style query scaling (optional)
         self.beta = None
         self.max_position_embeddings = None
-        if getattr(config, "apply_llama4_style_query_key_layer_scaling", False):
+        if (
+            getattr(config, "apply_llama4_style_query_key_layer_scaling", False)
+            and "llama_4_scaling_beta" in rope_parameters
+        ):
             self.beta = rope_parameters["llama_4_scaling_beta"]
             self.max_position_embeddings = rope_parameters["original_max_position_embeddings"]
             if (
@@ -228,16 +234,37 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         self._kv_cache_k = None
         self._kv_cache_v = None
         self._kv_cache_seq_len = 0
+        self._block_bidirectional_starts = None
+        self._block_bidirectional_ends = None
 
     def set_inference_mode(self, enabled: bool):
         """Enable or disable inference mode. Clears cache on disable."""
         self._inference_mode = enabled
         if not enabled:
             self.clear_kv_cache()
+            self.clear_block_bidirectional_mask()
 
     def set_inference_params(self, causal: bool, cache_enabled: bool):
         self._inference_causal = causal
         self._cache_enabled = cache_enabled
+        self.clear_block_bidirectional_mask()
+
+    def set_block_bidirectional_mask(
+        self,
+        block_starts: Tensor,
+        block_ends: Tensor,
+    ):
+        """Set per-sample spans that should use bidirectional block attention."""
+        if block_starts.ndim != 1 or block_ends.ndim != 1:
+            raise ValueError("block_starts and block_ends must be 1D tensors")
+        if block_starts.shape != block_ends.shape:
+            raise ValueError(f"block_starts shape {block_starts.shape} must match block_ends shape {block_ends.shape}")
+        self._block_bidirectional_starts = block_starts
+        self._block_bidirectional_ends = block_ends
+
+    def clear_block_bidirectional_mask(self):
+        self._block_bidirectional_starts = None
+        self._block_bidirectional_ends = None
 
     def clear_kv_cache(self):
         self._kv_cache_k = None
@@ -383,8 +410,30 @@ class NemotronLabsDiffusionAttention(MegatronModule):
 
         sk = full_key_expanded.shape[2]
 
-        # Build attention mask for SDPA
-        if not self._inference_causal:
+        # Build attention mask for SDPA.
+        attn_mask = None
+        is_causal = False
+        if self._block_bidirectional_starts is not None:
+            block_starts = self._block_bidirectional_starts.to(device=query.device)
+            block_ends = self._block_bidirectional_ends.to(device=query.device)
+            if block_starts.shape[0] != query.shape[0]:
+                raise ValueError(
+                    "block bidirectional mask batch size must match query batch "
+                    f"size: {block_starts.shape[0]} vs {query.shape[0]}"
+                )
+
+            mask = compute_active_block_bidirectional_mask(
+                block_starts=block_starts,
+                block_ends=block_ends,
+                q_len=sq,
+                kv_len=sk,
+                offset=offset,
+            )
+
+            attn_mask = torch.zeros(mask.shape, dtype=query.dtype, device=query.device)
+            attn_mask.masked_fill_(~mask, float("-inf"))
+            attn_mask = attn_mask.unsqueeze(1)
+        elif not self._inference_causal:
             # Bidirectional: no mask needed
             attn_mask = None
             is_causal = False
