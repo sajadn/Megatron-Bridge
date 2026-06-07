@@ -82,6 +82,88 @@ def compute_block_mask(block_size, max_seq_length):
     return create_block_mask(sbd_block_diff_mask, B=None, H=None, Q_LEN=q_len, KV_LEN=q_len)
 
 
+def compute_asymmetric_semi_ar_mask(
+    block_size,
+    noisy_length,
+    clean_length,
+    noisy_response_offset,
+    prompt_lengths,
+    noisy_valid_lengths,
+    clean_lengths,
+):
+    """Compute compact asymmetric semi-AR attention mask.
+
+    Layout is ``[noisy_response | clean_prompt_response]``. Noisy
+    response queries attend bidirectionally within their current noisy block,
+    to the clean prompt, and to clean response tokens from previous blocks.
+    Clean queries use ordinary causal attention over the clean side only.
+    """
+    if (
+        prompt_lengths.ndim != 1
+        or noisy_valid_lengths.ndim != 1
+        or clean_lengths.ndim != 1
+    ):
+        raise ValueError(
+            "prompt_lengths, noisy_valid_lengths, and clean_lengths must be 1D tensors"
+        )
+    if (
+        prompt_lengths.shape != noisy_valid_lengths.shape
+        or prompt_lengths.shape != clean_lengths.shape
+    ):
+        raise ValueError(
+            "Asymmetric semi-AR attention metadata tensors must have matching shapes"
+        )
+
+    full_seq_len = noisy_length + clean_length
+
+    def asymmetric_semi_ar_mask(b, h, q_idx, kv_idx):
+        del h
+        prompt_len = prompt_lengths[b]
+        noisy_valid_len = noisy_valid_lengths[b]
+        clean_len = clean_lengths[b]
+
+        q_is_noisy = q_idx < noisy_length
+        kv_is_noisy = kv_idx < noisy_length
+        q_noisy_rel = q_idx - noisy_response_offset
+        kv_noisy_rel = kv_idx - noisy_response_offset
+        q_noisy_valid = q_is_noisy & (q_noisy_rel >= 0) & (q_noisy_rel < noisy_valid_len)
+        kv_noisy_valid = kv_is_noisy & (kv_noisy_rel >= 0) & (kv_noisy_rel < noisy_valid_len)
+
+        q_block = torch.div(q_noisy_rel, block_size, rounding_mode="floor")
+        kv_block = torch.div(kv_noisy_rel, block_size, rounding_mode="floor")
+        noisy_same_block = q_noisy_valid & kv_noisy_valid & (q_block == kv_block)
+
+        q_clean_idx = q_idx - noisy_length
+        kv_clean_idx = kv_idx - noisy_length
+        q_clean_valid = (~q_is_noisy) & (q_clean_idx >= 0) & (q_clean_idx < clean_len)
+        kv_clean_valid = (~kv_is_noisy) & (kv_clean_idx >= 0) & (kv_clean_idx < clean_len)
+
+        clean_prompt = kv_clean_valid & (kv_clean_idx < prompt_len)
+        clean_response_rel = kv_clean_idx - prompt_len
+        clean_previous_response_blocks = (
+            kv_clean_valid
+            & (clean_response_rel >= 0)
+            & (clean_response_rel < q_block * block_size)
+        )
+        noisy_query = q_noisy_valid & (
+            noisy_same_block | clean_prompt | clean_previous_response_blocks
+        )
+
+        clean_causal = q_clean_valid & kv_clean_valid & (kv_clean_idx <= q_clean_idx)
+
+        valid_query = q_noisy_valid | q_clean_valid
+        invalid_query_self = (~valid_query) & (q_idx == kv_idx)
+        return noisy_query | clean_causal | invalid_query_self
+
+    return create_block_mask(
+        asymmetric_semi_ar_mask,
+        B=prompt_lengths.shape[0],
+        H=None,
+        Q_LEN=full_seq_len,
+        KV_LEN=full_seq_len,
+    )
+
+
 def compute_active_block_bidirectional_mask(block_starts, block_ends, q_len, kv_len, offset=0):
     """Build a causal mask with bidirectional attention inside each row's active block."""
     if block_starts.ndim != 1 or block_ends.ndim != 1:

@@ -33,6 +33,7 @@ from transformers import ROPE_INIT_FUNCTIONS
 
 from megatron.bridge.diffusion.common.dllm import (
     compute_active_block_bidirectional_mask,
+    compute_asymmetric_semi_ar_mask,
     compute_block_mask,
 )
 
@@ -222,6 +223,8 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         self.block_size = getattr(config, "block_size", 16)
         self.mask_seq_length = config.seq_length
         self._mask_cache = {}
+        self._asymmetric_semi_ar_mask_cache = {}
+        self._asymmetric_ar_metadata = None
 
         import torch._dynamo.config as dcfg
 
@@ -243,6 +246,43 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         if not enabled:
             self.clear_kv_cache()
             self.clear_block_bidirectional_mask()
+
+    def set_asymmetric_ar_metadata(
+        self,
+        noisy_length: int,
+        clean_length: int,
+        noisy_response_offset: int,
+        prompt_lengths: Tensor,
+        response_lengths: Tensor,
+        noisy_valid_lengths: Tensor,
+        clean_lengths: Tensor,
+    ):
+        """Set per-sample metadata for compact asymmetric semi-AR attention."""
+        if (
+            prompt_lengths.ndim != 1
+            or response_lengths.ndim != 1
+            or noisy_valid_lengths.ndim != 1
+            or clean_lengths.ndim != 1
+        ):
+            raise ValueError("Asymmetric semi-AR attention metadata tensors must be 1D")
+        if (
+            prompt_lengths.shape != response_lengths.shape
+            or prompt_lengths.shape != noisy_valid_lengths.shape
+            or prompt_lengths.shape != clean_lengths.shape
+        ):
+            raise ValueError("Asymmetric semi-AR attention metadata tensors must have matching shapes")
+        self._asymmetric_ar_metadata = {
+            "noisy_length": int(noisy_length),
+            "clean_length": int(clean_length),
+            "noisy_response_offset": int(noisy_response_offset),
+            "prompt_lengths": prompt_lengths,
+            "response_lengths": response_lengths,
+            "noisy_valid_lengths": noisy_valid_lengths,
+            "clean_lengths": clean_lengths,
+        }
+
+    def clear_asymmetric_ar_metadata(self):
+        self._asymmetric_ar_metadata = None
 
     def set_inference_params(self, causal: bool, cache_enabled: bool):
         self._inference_causal = causal
@@ -285,6 +325,9 @@ class NemotronLabsDiffusionAttention(MegatronModule):
 
         if self._inference_mode:
             return self._inference_forward(query, key, value)
+
+        if self._asymmetric_ar_metadata is not None:
+            return self._asymmetric_semi_ar_forward(query, key, value)
 
         # Position ids for each half of the doubled sequence
         half_seq_len = query.shape[0] // 2
@@ -337,6 +380,106 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.contiguous().view(*new_context_shape)
 
+        return context
+
+    def _asymmetric_semi_ar_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+    ) -> Tensor:
+        metadata = self._asymmetric_ar_metadata
+        if metadata is None:
+            raise RuntimeError("Asymmetric semi-AR metadata is not set")
+
+        noisy_length = metadata["noisy_length"]
+        clean_length = metadata["clean_length"]
+        noisy_response_offset = metadata["noisy_response_offset"]
+        full_seq_len = noisy_length + clean_length
+        if query.shape[0] != full_seq_len:
+            raise ValueError(
+                f"Asymmetric semi-AR attention expected sequence length {full_seq_len}, got {query.shape[0]}"
+            )
+
+        batch_size = query.shape[1]
+        prompt_lengths = metadata["prompt_lengths"].to(device=query.device, dtype=torch.long)
+        response_lengths = metadata["response_lengths"].to(device=query.device, dtype=torch.long)
+        noisy_valid_lengths = metadata["noisy_valid_lengths"].to(device=query.device, dtype=torch.long)
+        clean_lengths = metadata["clean_lengths"].to(device=query.device, dtype=torch.long)
+        if prompt_lengths.shape[0] != batch_size:
+            raise ValueError(
+                "Asymmetric semi-AR attention metadata batch size must match query batch "
+                f"size: {prompt_lengths.shape[0]} vs {batch_size}"
+            )
+
+        # [sq, b, np, hn] -> [b, np, sq, hn]
+        query = query.transpose(0, 1).transpose(1, 2)
+        key = key.transpose(0, 1).transpose(1, 2)
+        value = value.transpose(0, 1).transpose(1, 2)
+
+        noisy_positions = torch.arange(noisy_length, device=query.device).unsqueeze(0).expand(batch_size, -1)
+        noisy_rel_positions = noisy_positions - noisy_response_offset
+        noisy_valid = (noisy_rel_positions >= 0) & (noisy_rel_positions < noisy_valid_lengths.unsqueeze(1))
+        noisy_position_ids = prompt_lengths.unsqueeze(1) + torch.clamp(noisy_rel_positions, min=0)
+        noisy_position_ids = torch.where(noisy_valid, noisy_position_ids, torch.zeros_like(noisy_position_ids))
+
+        clean_position_ids = torch.arange(clean_length, device=query.device).unsqueeze(0).expand(batch_size, -1)
+
+        cos_noisy, sin_noisy = self.rope_embedding_module(query, noisy_position_ids)
+        cos_clean, sin_clean = self.rope_embedding_module(query, clean_position_ids)
+
+        q_noisy = query[:, :, :noisy_length, :]
+        q_clean = query[:, :, noisy_length:, :]
+        k_noisy = key[:, :, :noisy_length, :]
+        k_clean = key[:, :, noisy_length:, :]
+        q_noisy, k_noisy = apply_rotary_pos_emb(q_noisy, k_noisy, cos_noisy, sin_noisy)
+        q_clean, k_clean = apply_rotary_pos_emb(q_clean, k_clean, cos_clean, sin_clean)
+        query = torch.cat([q_noisy, q_clean], dim=2)
+        key = torch.cat([k_noisy, k_clean], dim=2)
+
+        if self.beta is not None:
+            position_ids = torch.cat([noisy_position_ids, clean_position_ids], dim=1)
+            scale = _get_llama_4_attn_scale(position_ids, self.beta, self.max_position_embeddings).to(query.dtype)
+            query = query * scale.unsqueeze(1)
+
+        n_rep = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+        key = repeat_kv(key, n_rep)
+        value = repeat_kv(value, n_rep)
+
+        cache_key = (
+            str(query.device),
+            full_seq_len,
+            noisy_length,
+            clean_length,
+            noisy_response_offset,
+            tuple(int(x) for x in prompt_lengths.detach().cpu().tolist()),
+            tuple(int(x) for x in noisy_valid_lengths.detach().cpu().tolist()),
+            tuple(int(x) for x in clean_lengths.detach().cpu().tolist()),
+        )
+        block_mask = self._asymmetric_semi_ar_mask_cache.get(cache_key)
+        if block_mask is None:
+            block_mask = compute_asymmetric_semi_ar_mask(
+                block_size=self.block_size,
+                noisy_length=noisy_length,
+                clean_length=clean_length,
+                noisy_response_offset=noisy_response_offset,
+                prompt_lengths=prompt_lengths,
+                noisy_valid_lengths=noisy_valid_lengths,
+                clean_lengths=clean_lengths,
+            )
+            self._asymmetric_semi_ar_mask_cache[cache_key] = block_mask
+
+        context = fused_flex_attention(query, key, value, block_mask=block_mask)
+
+        if not self.config.sequence_parallel:
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                context = self.attention_dropout(context)
+        else:
+            context = self.attention_dropout(context)
+
+        context = context.transpose(1, 2).transpose(0, 1)
+        new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
+        context = context.contiguous().view(*new_context_shape)
         return context
 
     def _inference_forward(
