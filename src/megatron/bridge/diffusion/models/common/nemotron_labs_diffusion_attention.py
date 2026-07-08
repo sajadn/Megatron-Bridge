@@ -76,7 +76,6 @@ from megatron.bridge.diffusion.common.dllm import (
     compute_active_block_bidirectional_mask,
     compute_asymmetric_semi_ar_mask,
     compute_block_bias,
-    compute_block_mask,
 )
 
 
@@ -170,9 +169,7 @@ class Ministral3RotaryEmbedding(nn.Module):
     def forward(self, x, position_ids):
         inv_freq = getattr(self, "original_inv_freq", self.inv_freq)
         inv_freq_expanded = (
-            inv_freq[None, :, None]
-            .to(device=x.device, dtype=torch.float32)
-            .expand(position_ids.shape[0], -1, 1)
+            inv_freq[None, :, None].to(device=x.device, dtype=torch.float32).expand(position_ids.shape[0], -1, 1)
         )
         position_ids_expanded = position_ids[:, None, :].float()
 
@@ -540,6 +537,15 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         clean_length = metadata["clean_length"]
         noisy_response_offset = metadata["noisy_response_offset"]
         full_seq_len = noisy_length + clean_length
+        # CP: reconstruct the full sequence on every rank before attention. q/k/v
+        # arrive zigzag-sharded along seq_dim=0 (sq = full_seq_len / cp_size);
+        # metadata (lengths/offsets) already describe the full sequence.
+        cp_size = self.cp_size
+        cp_group = parallel_state.get_context_parallel_group() if cp_size > 1 else None
+        if cp_size > 1:
+            query = all_gather_seq_cp(query, cp_group, seq_dim=0)
+            key = all_gather_seq_cp(key, cp_group, seq_dim=0)
+            value = all_gather_seq_cp(value, cp_group, seq_dim=0)
         if query.shape[0] != full_seq_len:
             raise ValueError(
                 f"Asymmetric semi-AR attention expected sequence length {full_seq_len}, got {query.shape[0]}"
@@ -547,7 +553,6 @@ class NemotronLabsDiffusionAttention(MegatronModule):
 
         batch_size = query.shape[1]
         prompt_lengths = metadata["prompt_lengths"].to(device=query.device, dtype=torch.long)
-        response_lengths = metadata["response_lengths"].to(device=query.device, dtype=torch.long)
         noisy_valid_lengths = metadata["noisy_valid_lengths"].to(device=query.device, dtype=torch.long)
         clean_lengths = metadata["clean_lengths"].to(device=query.device, dtype=torch.long)
         if prompt_lengths.shape[0] != batch_size:
@@ -624,6 +629,10 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         context = context.transpose(1, 2).transpose(0, 1)
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.contiguous().view(*new_context_shape)
+        # CP: scatter the full-sequence attention output back to this rank's
+        # zigzag shard so downstream layers operate on the sharded sequence.
+        if cp_size > 1:
+            context = scatter_seq_cp(context, cp_group, seq_dim=0)
         return context
 
     def _inference_forward(
