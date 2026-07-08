@@ -32,6 +32,14 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 # Helpers (ported from the original eval.py)
 # ---------------------------------------------------------------------------
+# Sampling primitives shared across all block-diffusion models in this repo.
+# Re-exported here so existing importers (and tests) that reference them from
+# this module continue to work unchanged.
+from megatron.bridge.diffusion.common.dllm import (
+    add_gumbel_noise,
+    get_num_transfer_tokens,
+    get_transfer_index,
+)
 
 
 def add_gumbel_noise(logits, temperature):
