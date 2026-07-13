@@ -52,6 +52,7 @@ numerically-equivalent gradients (cp=1 vs cp=2 vs cp=4) via the CP-sharding roun
 tests in ``tests/unit_tests/diffusion/common/test_cp_utils.py``.
 """
 
+import os
 import copy
 import math
 from typing import Optional
@@ -84,7 +85,13 @@ from megatron.bridge.diffusion.common.dllm import (
 # ---------------------------------------------------------------------------
 
 
-@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs", dynamic=False)
+# flex_attention compile mode. Default "max-autotune-no-cudagraphs" picks
+# memory-efficient kernels (needed to fit the 32K backward); its per-shape autotune
+# skew across ranks is handled by update_pg_timeout(240min) in nemo_rl megatron setup.
+# Override via env DIFFU_FLEX_COMPILE_MODE (e.g. "default" to disable autotune).
+_FLEX_COMPILE_MODE = os.environ.get("DIFFU_FLEX_COMPILE_MODE", "max-autotune-no-cudagraphs")
+
+@torch.compile(fullgraph=True, mode=_FLEX_COMPILE_MODE, dynamic=False)
 def fused_flex_attention(q, k, v, score_mod=None, block_mask=None, return_lse=False):
     """Thin compiled wrapper around flex_attention."""
     return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask, return_lse=return_lse)
