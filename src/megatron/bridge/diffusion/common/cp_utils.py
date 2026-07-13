@@ -59,6 +59,25 @@ def zigzag_slice(tensor: torch.Tensor, cp_rank: int, cp_size: int, seq_dim: int)
     return torch.cat([tensor[tuple(s1)], tensor[tuple(s2)]], dim=seq_dim).contiguous()
 
 
+def zigzag_local_to_global_idx(
+    local_idx: torch.Tensor, cp_rank: int, cp_size: int, local_len: int
+) -> torch.Tensor:
+    """Map local zigzag positions to global sequence positions.
+
+    Inverse of ``zigzag_slice`` for index tensors: local positions
+    ``[0, local_len)`` on ``cp_rank`` correspond to global chunks ``cp_rank``
+    (first half) and ``2*cp_size - 1 - cp_rank`` (second half). Pure tensor op
+    (usable inside a flex-attention ``mask_mod``). Identity when cp_size == 1.
+    """
+    if cp_size == 1:
+        return local_idx
+    half = local_len // 2
+    in_first = local_idx < half
+    g_first = cp_rank * half + local_idx
+    g_second = (2 * cp_size - 1 - cp_rank) * half + (local_idx - half)
+    return torch.where(in_first, g_first, g_second)
+
+
 class _AllGatherSeqCP(torch.autograd.Function):
     """All-gather a CP-zigzag-sharded tensor to the full sequence on every rank.
 
@@ -162,6 +181,53 @@ class _ScatterSeqCP(torch.autograd.Function):
 def scatter_seq_cp(tensor: torch.Tensor, cp_group, seq_dim: int = 1) -> torch.Tensor:
     """Autograd scatter of a full-sequence tensor to this CP rank's zigzag slice."""
     return _ScatterSeqCP.apply(tensor, cp_group, seq_dim)
+
+
+class _AllGatherKVSeqCP(torch.autograd.Function):
+    """All-gather K/V shards to the full sequence for local-Q attention.
+
+    Forward is identical to ``_AllGatherSeqCP`` (every rank reconstructs the
+    full global order). Backward differs: with Q kept local, each rank's K/V
+    gradient only carries the contributions of its own query rows, so the true
+    gradient of the local shard is the SUM over ranks of the full-length grad,
+    sliced to this rank's zigzag chunks. ``_AllGatherSeqCP``'s slice-only
+    backward assumes the downstream grad is replicated and would silently drop
+    the cross-rank terms here.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, cp_group, seq_dim):
+        cp_size = torch.distributed.get_world_size(cp_group)
+        ctx.cp_group = cp_group
+        ctx.cp_size = cp_size
+        ctx.seq_dim = seq_dim
+        if cp_size == 1:
+            return tensor.contiguous()
+        tensor = tensor.contiguous()
+        gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, tensor, group=cp_group)
+        return _reorder_zigzag_chunks(gathered, cp_size, seq_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        cp_size = ctx.cp_size
+        if cp_size == 1:
+            return grad_output, None, None
+        # Clone: all_reduce writes in place, and the incoming grad must not be
+        # mutated (matches the no-mutation discipline of the sibling Functions).
+        grad_output = grad_output.contiguous().clone()
+        torch.distributed.all_reduce(grad_output, group=ctx.cp_group)
+        cp_rank = torch.distributed.get_rank(ctx.cp_group)
+        return (
+            zigzag_slice(grad_output, cp_rank, cp_size, ctx.seq_dim),
+            None,
+            None,
+        )
+
+
+def all_gather_kv_seq_cp(tensor: torch.Tensor, cp_group, seq_dim: int = 1) -> torch.Tensor:
+    """Autograd K/V all-gather for local-Q attention (backward = all-reduce + slice)."""
+    return _AllGatherKVSeqCP.apply(tensor, cp_group, seq_dim)
 
 
 def local_zigzag_mask(seq_len: int, cp_rank: int, cp_size: int, device) -> torch.Tensor:

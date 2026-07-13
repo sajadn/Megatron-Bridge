@@ -30,12 +30,56 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from megatron.bridge.diffusion.common.cp_utils import (
-    all_gather_seq_cp,
-    local_zigzag_mask,
-    zigzag_slice,
-)
-from megatron.bridge.diffusion.common.dllm import compute_block_bias
+try:
+    from megatron.bridge.diffusion.common.cp_utils import (
+        all_gather_seq_cp,
+        local_zigzag_mask,
+        zigzag_slice,
+    )
+    from megatron.bridge.diffusion.common.dllm import compute_block_bias
+except ModuleNotFoundError:
+    # mp.spawn children re-import this module in a fresh interpreter where the
+    # conftest path-loader never ran; load the modules under test from source
+    # the same way the conftest does.
+    import importlib.util
+    import sys
+    import types
+    from pathlib import Path
+
+    _SRC = Path(__file__).parents[5] / "src"
+
+    for _ns in [
+        "megatron",
+        "megatron.bridge",
+        "megatron.bridge.diffusion",
+        "megatron.bridge.diffusion.common",
+    ]:
+        if _ns not in sys.modules:
+            _m = types.ModuleType(_ns)
+            _m.__path__ = []
+            _m.__package__ = _ns
+            sys.modules[_ns] = _m
+
+    def _load(module_name: str, rel_path: str) -> None:
+        spec = importlib.util.spec_from_file_location(module_name, _SRC / rel_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        spec.loader.exec_module(mod)
+
+    _load(
+        "megatron.bridge.diffusion.common.cp_utils",
+        "megatron/bridge/diffusion/common/cp_utils.py",
+    )
+    _load(
+        "megatron.bridge.diffusion.common.dllm",
+        "megatron/bridge/diffusion/common/dllm.py",
+    )
+    from megatron.bridge.diffusion.common.cp_utils import (
+        all_gather_seq_cp,
+        local_zigzag_mask,
+        zigzag_slice,
+    )
+    from megatron.bridge.diffusion.common.dllm import compute_block_bias
 
 
 # ---------------------------------------------------------------------------

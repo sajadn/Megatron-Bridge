@@ -72,7 +72,12 @@ from torch import Tensor
 from torch.nn.attention.flex_attention import flex_attention
 from transformers import ROPE_INIT_FUNCTIONS
 
-from megatron.bridge.diffusion.common.cp_utils import all_gather_seq_cp, scatter_seq_cp
+from megatron.bridge.diffusion.common.cp_utils import (
+    all_gather_kv_seq_cp,
+    all_gather_seq_cp,
+    scatter_seq_cp,
+    zigzag_slice,
+)
 from megatron.bridge.diffusion.common.dllm import (
     compute_active_block_bidirectional_mask,
     compute_asymmetric_semi_ar_mask,
@@ -90,6 +95,13 @@ from megatron.bridge.diffusion.common.dllm import (
 # skew across ranks is handled by update_pg_timeout(240min) in nemo_rl megatron setup.
 # Override via env DIFFU_FLEX_COMPILE_MODE (e.g. "default" to disable autotune).
 _FLEX_COMPILE_MODE = os.environ.get("DIFFU_FLEX_COMPILE_MODE", "max-autotune-no-cudagraphs")
+
+# Opt-in local-Q context parallelism for the asymmetric semi-AR flex path: keep Q
+# zigzag-local and all-gather only K/V, instead of gathering Q/K/V to the full
+# sequence. Shards the attention FLOPs and the saved q/out activations by cp_size
+# (K/V stay full-length). Default off until parity-validated at scale.
+_CP_LOCAL_Q = os.environ.get("DIFFU_CP_LOCAL_Q", "0") == "1"
+_CP_LOCAL_Q_LOGGED = False
 
 @torch.compile(fullgraph=True, mode=_FLEX_COMPILE_MODE, dynamic=False)
 def fused_flex_attention(q, k, v, score_mod=None, block_mask=None, return_lse=False):
@@ -109,13 +121,19 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Apply rotary position embeddings to query and key tensors."""
+def apply_rotary_pos_emb_single(x, cos, sin, unsqueeze_dim=1):
+    """Apply rotary position embeddings to a single tensor."""
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return (x * cos) + (rotate_half(x) * sin)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """Apply rotary position embeddings to query and key tensors."""
+    return (
+        apply_rotary_pos_emb_single(q, cos, sin, unsqueeze_dim),
+        apply_rotary_pos_emb_single(k, cos, sin, unsqueeze_dim),
+    )
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -544,18 +562,39 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         clean_length = metadata["clean_length"]
         noisy_response_offset = metadata["noisy_response_offset"]
         full_seq_len = noisy_length + clean_length
-        # CP: reconstruct the full sequence on every rank before attention. q/k/v
-        # arrive zigzag-sharded along seq_dim=0 (sq = full_seq_len / cp_size);
-        # metadata (lengths/offsets) already describe the full sequence.
+        # CP: q/k/v arrive zigzag-sharded along seq_dim=0 (sq = full_seq_len /
+        # cp_size); metadata (lengths/offsets) always describe the full sequence.
+        # Default path reconstructs the full sequence on every rank before
+        # attention. With DIFFU_CP_LOCAL_Q=1, Q stays local and only K/V are
+        # gathered: flex computes just this rank's query rows (1/cp of the
+        # attention FLOPs, local-length q/output activations). The K/V gather's
+        # backward is an all-reduce+slice, since each rank's K/V grad only
+        # carries its own query rows' contributions.
         cp_size = self.cp_size
         cp_group = parallel_state.get_context_parallel_group() if cp_size > 1 else None
+        cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
+        local_q = cp_size > 1 and _CP_LOCAL_Q
+        global _CP_LOCAL_Q_LOGGED
+        if local_q and not _CP_LOCAL_Q_LOGGED:
+            _CP_LOCAL_Q_LOGGED = True
+            print(
+                "[NemotronLabsDiffusionAttention] DIFFU_CP_LOCAL_Q=1: "
+                "local-Q flex CP path active",
+                flush=True,
+            )
         if cp_size > 1:
-            query = all_gather_seq_cp(query, cp_group, seq_dim=0)
-            key = all_gather_seq_cp(key, cp_group, seq_dim=0)
-            value = all_gather_seq_cp(value, cp_group, seq_dim=0)
-        if query.shape[0] != full_seq_len:
+            if local_q:
+                key = all_gather_kv_seq_cp(key, cp_group, seq_dim=0)
+                value = all_gather_kv_seq_cp(value, cp_group, seq_dim=0)
+            else:
+                query = all_gather_seq_cp(query, cp_group, seq_dim=0)
+                key = all_gather_seq_cp(key, cp_group, seq_dim=0)
+                value = all_gather_seq_cp(value, cp_group, seq_dim=0)
+        expected_q_len = full_seq_len // cp_size if local_q else full_seq_len
+        if query.shape[0] != expected_q_len or key.shape[0] != full_seq_len:
             raise ValueError(
-                f"Asymmetric semi-AR attention expected sequence length {full_seq_len}, got {query.shape[0]}"
+                f"Asymmetric semi-AR attention expected q/kv sequence lengths "
+                f"{expected_q_len}/{full_seq_len}, got {query.shape[0]}/{key.shape[0]}"
             )
 
         batch_size = query.shape[1]
@@ -581,20 +620,34 @@ class NemotronLabsDiffusionAttention(MegatronModule):
 
         clean_position_ids = torch.arange(clean_length, device=query.device).unsqueeze(0).expand(batch_size, -1)
 
-        cos_noisy, sin_noisy = self.rope_embedding_module(query, noisy_position_ids)
-        cos_clean, sin_clean = self.rope_embedding_module(query, clean_position_ids)
+        if local_q:
+            # RoPE is elementwise per position, so the per-half application below
+            # is equivalent to one pass with the concatenated position ids. K is
+            # full-length; Q uses this rank's zigzag slice of the position ids.
+            position_ids_full = torch.cat([noisy_position_ids, clean_position_ids], dim=1)
+            cos_full, sin_full = self.rope_embedding_module(key, position_ids_full)
+            key = apply_rotary_pos_emb_single(key, cos_full, sin_full)
+            q_position_ids = zigzag_slice(position_ids_full, cp_rank, cp_size, seq_dim=1)
+            cos_q, sin_q = self.rope_embedding_module(query, q_position_ids)
+            query = apply_rotary_pos_emb_single(query, cos_q, sin_q)
+        else:
+            cos_noisy, sin_noisy = self.rope_embedding_module(query, noisy_position_ids)
+            cos_clean, sin_clean = self.rope_embedding_module(query, clean_position_ids)
 
-        q_noisy = query[:, :, :noisy_length, :]
-        q_clean = query[:, :, noisy_length:, :]
-        k_noisy = key[:, :, :noisy_length, :]
-        k_clean = key[:, :, noisy_length:, :]
-        q_noisy, k_noisy = apply_rotary_pos_emb(q_noisy, k_noisy, cos_noisy, sin_noisy)
-        q_clean, k_clean = apply_rotary_pos_emb(q_clean, k_clean, cos_clean, sin_clean)
-        query = torch.cat([q_noisy, q_clean], dim=2)
-        key = torch.cat([k_noisy, k_clean], dim=2)
+            q_noisy = query[:, :, :noisy_length, :]
+            q_clean = query[:, :, noisy_length:, :]
+            k_noisy = key[:, :, :noisy_length, :]
+            k_clean = key[:, :, noisy_length:, :]
+            q_noisy, k_noisy = apply_rotary_pos_emb(q_noisy, k_noisy, cos_noisy, sin_noisy)
+            q_clean, k_clean = apply_rotary_pos_emb(q_clean, k_clean, cos_clean, sin_clean)
+            query = torch.cat([q_noisy, q_clean], dim=2)
+            key = torch.cat([k_noisy, k_clean], dim=2)
 
         if self.beta is not None:
-            position_ids = torch.cat([noisy_position_ids, clean_position_ids], dim=1)
+            if local_q:
+                position_ids = q_position_ids
+            else:
+                position_ids = torch.cat([noisy_position_ids, clean_position_ids], dim=1)
             scale = _get_llama_4_attn_scale(position_ids, self.beta, self.max_position_embeddings).to(query.dtype)
             query = query * scale.unsqueeze(1)
 
@@ -602,6 +655,7 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         key = repeat_kv(key, n_rep)
         value = repeat_kv(value, n_rep)
 
+        mask_cp_size = cp_size if local_q else 1
         cache_key = (
             str(query.device),
             full_seq_len,
@@ -611,6 +665,7 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             tuple(int(x) for x in prompt_lengths.detach().cpu().tolist()),
             tuple(int(x) for x in noisy_valid_lengths.detach().cpu().tolist()),
             tuple(int(x) for x in clean_lengths.detach().cpu().tolist()),
+            mask_cp_size,
         )
         block_mask = self._asymmetric_semi_ar_mask_cache.get(cache_key)
         if block_mask is None:
@@ -622,6 +677,8 @@ class NemotronLabsDiffusionAttention(MegatronModule):
                 prompt_lengths=prompt_lengths,
                 noisy_valid_lengths=noisy_valid_lengths,
                 clean_lengths=clean_lengths,
+                cp_rank=cp_rank if local_q else 0,
+                cp_size=mask_cp_size,
             )
             self._asymmetric_semi_ar_mask_cache[cache_key] = block_mask
 
@@ -638,7 +695,8 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         context = context.contiguous().view(*new_context_shape)
         # CP: scatter the full-sequence attention output back to this rank's
         # zigzag shard so downstream layers operate on the sharded sequence.
-        if cp_size > 1:
+        # (Local-Q path: the output already covers only this rank's rows.)
+        if cp_size > 1 and not local_q:
             context = scatter_seq_cp(context, cp_group, seq_dim=0)
         return context
 

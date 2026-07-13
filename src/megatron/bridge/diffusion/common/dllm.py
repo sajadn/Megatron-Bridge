@@ -30,6 +30,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
+from megatron.bridge.diffusion.common.cp_utils import zigzag_local_to_global_idx
+
 
 def forward_process_simple_masking(input_ids, mask_token_id, eps=1e-3, loss_mask=None, generator=None):
     """Uniform random masking for diffusion LM training.
@@ -221,6 +223,8 @@ def compute_asymmetric_semi_ar_mask(
     prompt_lengths,
     noisy_valid_lengths,
     clean_lengths,
+    cp_rank=0,
+    cp_size=1,
 ):
     """Compute compact asymmetric semi-AR attention mask.
 
@@ -228,6 +232,11 @@ def compute_asymmetric_semi_ar_mask(
     response queries attend bidirectionally within their current noisy block,
     to the clean prompt, and to clean response tokens from previous blocks.
     Clean queries use ordinary causal attention over the clean side only.
+
+    With ``cp_size > 1`` the mask is built for local-Q context parallelism:
+    query rows are this rank's zigzag shard of the sequence (``Q_LEN =
+    full_seq_len / cp_size``, indices remapped to global positions) while KV
+    columns span the full gathered sequence.
     """
     if (
         prompt_lengths.ndim != 1
@@ -286,12 +295,28 @@ def compute_asymmetric_semi_ar_mask(
         invalid_query_self = (~valid_query) & (q_idx == kv_idx)
         return noisy_query | clean_causal | invalid_query_self
 
+    mask_mod = asymmetric_semi_ar_mask
+    q_len = full_seq_len
+    if cp_size > 1:
+        assert full_seq_len % (2 * cp_size) == 0, (
+            f"full_seq_len {full_seq_len} not divisible by 2*cp_size {2 * cp_size}"
+        )
+        q_len = full_seq_len // cp_size
+
+        def cp_local_q_mask(b, h, q_idx, kv_idx):
+            return asymmetric_semi_ar_mask(
+                b, h, zigzag_local_to_global_idx(q_idx, cp_rank, cp_size, q_len), kv_idx
+            )
+
+        mask_mod = cp_local_q_mask
+
     return create_block_mask(
-        asymmetric_semi_ar_mask,
+        mask_mod,
         B=prompt_lengths.shape[0],
         H=None,
-        Q_LEN=full_seq_len,
+        Q_LEN=q_len,
         KV_LEN=full_seq_len,
+        device=prompt_lengths.device,
     )
 
 
