@@ -150,3 +150,10 @@ register_bridge_implementation(
     target=GPTModel,
     bridge_class=NemotronLabsDiffusionBridge,
 )
+
+# Native arch name of Nemotron-Labs-Diffusion v1.5+ checkpoints (identical weight layout)
+register_bridge_implementation(
+    source="NemotronLabsDiffusionModel",
+    target=GPTModel,
+    bridge_class=NemotronLabsDiffusionBridge,
+)

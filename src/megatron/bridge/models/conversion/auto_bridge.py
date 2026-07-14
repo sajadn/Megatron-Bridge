@@ -62,6 +62,7 @@ SUPPORTED_HF_ARCHITECTURES: tuple[str, ...] = (
     "NemotronH_Nano_VL_V2",
     "Qwen2_5OmniModel",
     "MinistralDiffEncoderModel",  # required for NemotronLabsDiffusion
+    "NemotronLabsDiffusionModel",  # native arch name of Nemotron-Labs-Diffusion v1.5+ checkpoints
 )
 
 # Mapping from non-standard HF architecture names to their actual transformers class names.
