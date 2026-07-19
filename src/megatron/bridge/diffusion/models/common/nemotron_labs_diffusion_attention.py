@@ -353,6 +353,14 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         import torch._dynamo.config as dcfg
 
         dcfg.cache_size_limit = 512
+        # Block-reveal / DiffuGRPO RL replays the compiled flex path under many
+        # distinct (padded-seq-length, grad_mode) shapes; with fullgraph=True and
+        # dynamic=False each is a fresh recompile, so the cumulative count crosses
+        # torch's global accumulated_recompile_limit (default 256) mid-run and raises
+        # FailOnRecompileLimitHit. The set of padded shapes is finite (steady state
+        # is reached), so raise the ceiling to let a long RL run continue.
+        if hasattr(dcfg, "accumulated_recompile_limit"):
+            dcfg.accumulated_recompile_limit = 1_000_000
 
         # Inference state
         self._inference_mode = False
