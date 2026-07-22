@@ -54,6 +54,7 @@ tests in ``tests/unit_tests/diffusion/common/test_cp_utils.py``.
 
 import os
 import copy
+import inspect
 import math
 from typing import Optional
 
@@ -96,17 +97,25 @@ from megatron.bridge.diffusion.common.dllm import (
 # Override via env DIFFU_FLEX_COMPILE_MODE (e.g. "default" to disable autotune).
 _FLEX_COMPILE_MODE = os.environ.get("DIFFU_FLEX_COMPILE_MODE", "max-autotune-no-cudagraphs")
 
+# Native grouped-query attention in flex (query heads broadcast onto fewer KV
+# heads inside the kernel) -- present in torch >= 2.10. When available, K/V are
+# fed at GQA width instead of materializing repeat_kv copies.
+_FLEX_SUPPORTS_GQA = "enable_gqa" in inspect.signature(flex_attention).parameters
+
 # Opt-in local-Q context parallelism for the asymmetric semi-AR flex path: keep Q
 # zigzag-local and all-gather only K/V, instead of gathering Q/K/V to the full
 # sequence. Shards the attention FLOPs and the saved q/out activations by cp_size
 # (K/V stay full-length). Default off until parity-validated at scale.
 _CP_LOCAL_Q = os.environ.get("DIFFU_CP_LOCAL_Q", "0") == "1"
 _CP_LOCAL_Q_LOGGED = False
+_GQA_PATH_LOGGED = False
 
 @torch.compile(fullgraph=True, mode=_FLEX_COMPILE_MODE, dynamic=False)
-def fused_flex_attention(q, k, v, score_mod=None, block_mask=None, return_lse=False):
+def fused_flex_attention(q, k, v, score_mod=None, block_mask=None, return_lse=False, enable_gqa=False):
     """Thin compiled wrapper around flex_attention."""
-    return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask, return_lse=return_lse)
+    return flex_attention(
+        q, k, v, score_mod=score_mod, block_mask=block_mask, return_lse=return_lse, enable_gqa=enable_gqa
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -651,9 +660,25 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             scale = _get_llama_4_attn_scale(position_ids, self.beta, self.max_position_embeddings).to(query.dtype)
             query = query * scale.unsqueeze(1)
 
+        # GQA: prefer the kernel's native grouped-KV broadcast over materializing
+        # repeat_kv copies -- flex saves the K/V it consumes for the backward, and
+        # the repeated copies cost H_q/H_kv (4x for this family) more activation
+        # memory at the full gathered sequence length under CP. Fallback to
+        # repeat_kv on flex versions without enable_gqa.
         n_rep = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
-        key = repeat_kv(key, n_rep)
-        value = repeat_kv(value, n_rep)
+        use_native_gqa = _FLEX_SUPPORTS_GQA and n_rep > 1
+        global _GQA_PATH_LOGGED
+        if not _GQA_PATH_LOGGED:
+            _GQA_PATH_LOGGED = True
+            print(
+                f"[NemotronLabsDiffusionAttention] flex GQA path: "
+                f"{'native enable_gqa' if use_native_gqa else ('repeat_kv fallback' if n_rep > 1 else 'no GQA (n_rep=1)')} "
+                f"(n_rep={n_rep}, flex_supports_gqa={_FLEX_SUPPORTS_GQA})",
+                flush=True,
+            )
+        if n_rep > 1 and not use_native_gqa:
+            key = repeat_kv(key, n_rep)
+            value = repeat_kv(value, n_rep)
 
         mask_cp_size = cp_size if local_q else 1
         cache_key = (
@@ -682,7 +707,9 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             )
             self._asymmetric_semi_ar_mask_cache[cache_key] = block_mask
 
-        context = fused_flex_attention(query, key, value, block_mask=block_mask)
+        context = fused_flex_attention(
+            query, key, value, block_mask=block_mask, enable_gqa=use_native_gqa
+        )
 
         if not self.config.sequence_parallel:
             with tensor_parallel.get_cuda_rng_tracker().fork():
