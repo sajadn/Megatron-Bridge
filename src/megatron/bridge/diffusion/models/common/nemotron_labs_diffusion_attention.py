@@ -110,6 +110,43 @@ _CP_LOCAL_Q = os.environ.get("DIFFU_CP_LOCAL_Q", "0") == "1"
 _CP_LOCAL_Q_LOGGED = False
 _GQA_PATH_LOGGED = False
 
+# The asymmetric semi-AR BlockMask depends only on metadata that is identical
+# across every attention layer (block size, segment lengths, per-sample valid
+# lengths, cp rank/size). One slot per microbatch therefore serves all layers'
+# forwards AND the backward recompute under activation checkpointing.
+#
+# It is invalidated in set_asymmetric_ar_metadata, which the policy worker
+# calls on EVERY attention module before any forward runs; clear_asymmetric_
+# ar_metadata only fires at the end of the whole pass and is not a per-
+# microbatch boundary. Assumes one metadata generation is live at a time in a
+# process, which that worker loop guarantees; if two models interleaved, this
+# would rebuild more often (slower) but never serve a stale mask.
+#
+# The previous per-instance dict keyed on per-sample length tuples never hit
+# across microbatches (measured 0%: builds/entries == layer count exactly),
+# grew without bound in GPU memory, and cost ~3 device syncs per layer to
+# build a key that was never looked up again.
+_CURRENT_MASK = None
+
+# Diagnostic, default off: set DIFFU_MASK_CACHE_DEBUG to any value except
+# off/0/false/no. Pass a WORD (e.g. "enable") -- config overrides route through
+# OmegaConf, which coerces a bare 1 / true to int / bool and then trips Ray's
+# Dict[str, str] check on runtime_env["env_vars"].
+_MASK_CACHE_DEBUG = os.environ.get("DIFFU_MASK_CACHE_DEBUG", "").lower() not in (
+    "",
+    "0",
+    "off",
+    "false",
+    "no",
+)
+_MASK_CACHE_DEBUG_EVERY = int(os.environ.get("DIFFU_MASK_CACHE_DEBUG_EVERY", "25"))
+_MASK_BUILD_COUNT = 0
+# Distinct (Q_LEN, KV_LEN) pairs seen. Sequence length varies per microbatch
+# (noisy_length is a per-microbatch max), so this counts how many shapes any
+# statically-compiled consumer would have to specialize on.
+_MASK_SHAPES = set()
+
+
 @torch.compile(fullgraph=True, mode=_FLEX_COMPILE_MODE, dynamic=False)
 def fused_flex_attention(q, k, v, score_mod=None, block_mask=None, return_lse=False, enable_gqa=False):
     """Thin compiled wrapper around flex_attention."""
@@ -313,7 +350,6 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         self.block_size = getattr(config, "block_size", 16)
         self.mask_seq_length = config.seq_length
         self._mask_cache = {}
-        self._asymmetric_semi_ar_mask_cache = {}
         self._asymmetric_ar_metadata = None
 
         # TE core attention run WITHOUT CP (cp=1 config copy): cuDNN supports
@@ -404,6 +440,9 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             or prompt_lengths.shape != clean_lengths.shape
         ):
             raise ValueError("Asymmetric semi-AR attention metadata tensors must have matching shapes")
+        # New metadata => any mask built for the previous microbatch is stale.
+        global _CURRENT_MASK
+        _CURRENT_MASK = None
         self._asymmetric_ar_metadata = {
             "noisy_length": int(noisy_length),
             "clean_length": int(clean_length),
@@ -681,18 +720,8 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             value = repeat_kv(value, n_rep)
 
         mask_cp_size = cp_size if local_q else 1
-        cache_key = (
-            str(query.device),
-            full_seq_len,
-            noisy_length,
-            clean_length,
-            noisy_response_offset,
-            tuple(int(x) for x in prompt_lengths.detach().cpu().tolist()),
-            tuple(int(x) for x in noisy_valid_lengths.detach().cpu().tolist()),
-            tuple(int(x) for x in clean_lengths.detach().cpu().tolist()),
-            mask_cp_size,
-        )
-        block_mask = self._asymmetric_semi_ar_mask_cache.get(cache_key)
+        global _CURRENT_MASK, _MASK_BUILD_COUNT
+        block_mask = _CURRENT_MASK
         if block_mask is None:
             block_mask = compute_asymmetric_semi_ar_mask(
                 block_size=self.block_size,
@@ -705,7 +734,18 @@ class NemotronLabsDiffusionAttention(MegatronModule):
                 cp_rank=cp_rank if local_q else 0,
                 cp_size=mask_cp_size,
             )
-            self._asymmetric_semi_ar_mask_cache[cache_key] = block_mask
+            _CURRENT_MASK = block_mask
+            if _MASK_CACHE_DEBUG:
+                _MASK_BUILD_COUNT += 1
+                _MASK_SHAPES.add((int(query.shape[2]), int(key.shape[2])))
+                if _MASK_BUILD_COUNT % _MASK_CACHE_DEBUG_EVERY == 0:
+                    print(
+                        f"[mask-cache] builds={_MASK_BUILD_COUNT} "
+                        f"distinct_shapes={len(_MASK_SHAPES)} "
+                        f"cuda_alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB "
+                        f"q_len={query.shape[2]} kv_len={key.shape[2]}",
+                        flush=True,
+                    )
 
         context = fused_flex_attention(
             query, key, value, block_mask=block_mask, enable_gqa=use_native_gqa

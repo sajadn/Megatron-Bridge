@@ -23,6 +23,7 @@ calls these helpers to score confidence and choose which masked positions to
 unmask at each step.
 """
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -31,6 +32,53 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
 from megatron.bridge.diffusion.common.cp_utils import zigzag_local_to_global_idx
+
+
+# torch's default create_block_mask evaluates mask_mod over the dense
+# [B, H, Q_LEN, KV_LEN] grid (see create_mask) before reducing it to 128x128
+# tiles, costing ~10 bytes per grid element -- 160 GB at a 128K doubled
+# sequence with cp=4, which OOMs. Routing the build through torch.compile
+# fuses the predicate into the tile reduction so the dense grid is never
+# allocated (28 MiB at that same geometry, bit-identical BlockMask).
+#
+# dynamic=True is REQUIRED, not cosmetic: Q_LEN/KV_LEN arrive as Python ints
+# and static compilation specializes on them by value, needing one compile per
+# sequence length (11-60 s each) and hitting Dynamo's default recompile_limit
+# of 8 -- after which it silently falls back to eager and the fix disappears.
+# With dynamic=True a single kernel serves every shape (two once the grid
+# crosses 2**31 and 64-bit indexing kicks in). See
+# plans/mask_build_cost_findings.md.
+#
+# On by default; DIFFU_MASK_COMPILE=off restores the eager path.
+_MASK_COMPILE = os.environ.get("DIFFU_MASK_COMPILE", "on").lower() not in (
+    "0",
+    "off",
+    "false",
+    "no",
+)
+_MASK_COMPILE_DYNAMIC = os.environ.get("DIFFU_MASK_COMPILE_DYNAMIC", "on").lower() not in (
+    "0",
+    "off",
+    "false",
+    "no",
+)
+_COMPILED_CREATE_BLOCK_MASK = None
+
+
+def _build_block_mask(*args, **kwargs):
+    """create_block_mask, optionally compiled (one wrapper, reused)."""
+    global _COMPILED_CREATE_BLOCK_MASK
+    if not _MASK_COMPILE:
+        return create_block_mask(*args, **kwargs)
+    if _COMPILED_CREATE_BLOCK_MASK is None:
+        _COMPILED_CREATE_BLOCK_MASK = torch.compile(
+            create_block_mask, dynamic=_MASK_COMPILE_DYNAMIC
+        )
+        print(
+            f"[dllm] BlockMask build compiled (dynamic={_MASK_COMPILE_DYNAMIC})",
+            flush=True,
+        )
+    return _COMPILED_CREATE_BLOCK_MASK(*args, **kwargs)
 
 
 def forward_process_simple_masking(input_ids, mask_token_id, eps=1e-3, loss_mask=None, generator=None):
@@ -212,7 +260,7 @@ def compute_block_mask(block_size, max_seq_length):
         return block_diagonal | offset_block_causal | fully_causal
 
     q_len = max_seq_length * 2
-    return create_block_mask(sbd_block_diff_mask, B=None, H=None, Q_LEN=q_len, KV_LEN=q_len)
+    return _build_block_mask(sbd_block_diff_mask, B=None, H=None, Q_LEN=q_len, KV_LEN=q_len)
 
 
 def compute_asymmetric_semi_ar_mask(
@@ -310,7 +358,7 @@ def compute_asymmetric_semi_ar_mask(
 
         mask_mod = cp_local_q_mask
 
-    return create_block_mask(
+    return _build_block_mask(
         mask_mod,
         B=prompt_lengths.shape[0],
         H=None,
