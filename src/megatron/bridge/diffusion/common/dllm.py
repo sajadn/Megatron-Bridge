@@ -31,7 +31,10 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
-from megatron.bridge.diffusion.common.cp_utils import zigzag_local_to_global_idx
+from megatron.bridge.diffusion.common.cp_utils import (
+    segmented_zigzag_index_table,
+    zigzag_local_to_global_idx,
+)
 
 
 # torch's default create_block_mask evaluates mask_mod over the dense
@@ -263,46 +266,39 @@ def compute_block_mask(block_size, max_seq_length):
     return _build_block_mask(sbd_block_diff_mask, B=None, H=None, Q_LEN=q_len, KV_LEN=q_len)
 
 
-def compute_asymmetric_semi_ar_mask(
+def asymmetric_semi_ar_mask_mod(
     block_size,
     noisy_length,
-    clean_length,
     noisy_response_offset,
     prompt_lengths,
     noisy_valid_lengths,
     clean_lengths,
-    cp_rank=0,
-    cp_size=1,
 ):
-    """Compute compact asymmetric semi-AR attention mask.
+    """Build the asymmetric semi-AR ``mask_mod`` in GLOBAL sequence coordinates.
 
-    Layout is ``[noisy_response | clean_prompt_response]``. Noisy
-    response queries attend bidirectionally within their current noisy block,
-    to the clean prompt, and to clean response tokens from previous blocks.
-    Clean queries use ordinary causal attention over the clean side only.
+    Layout is ``[noisy_response | clean_prompt_response]``. Noisy response
+    queries attend bidirectionally within their current noisy block, to the
+    clean prompt, and to clean response tokens from previous blocks. Clean
+    queries use ordinary causal attention over the clean side only. Queries
+    outside their sample's valid extent attend only themselves, so no row is
+    fully masked.
 
-    With ``cp_size > 1`` the mask is built for local-Q context parallelism:
-    query rows are this rank's zigzag shard of the sequence (``Q_LEN =
-    full_seq_len / cp_size``, indices remapped to global positions) while KV
-    columns span the full gathered sequence.
+    Every context-parallel variant reuses this predicate unchanged and only
+    remaps its local q/kv indices to global ones before calling it, so the mask
+    semantics have exactly one definition.
+
+    Args:
+        block_size: Noisy block size.
+        noisy_length: Length of the noisy section (the global split point).
+        noisy_response_offset: Column where the response starts in the noisy
+            section (the noisy block grid is anchored here).
+        prompt_lengths: Per-sample prompt length within the clean section.
+        noisy_valid_lengths: Per-sample valid extent of the noisy section.
+        clean_lengths: Per-sample valid extent of the clean section.
+
+    Returns:
+        ``mask_mod(b, h, q_idx, kv_idx)`` over global indices.
     """
-    if (
-        prompt_lengths.ndim != 1
-        or noisy_valid_lengths.ndim != 1
-        or clean_lengths.ndim != 1
-    ):
-        raise ValueError(
-            "prompt_lengths, noisy_valid_lengths, and clean_lengths must be 1D tensors"
-        )
-    if (
-        prompt_lengths.shape != noisy_valid_lengths.shape
-        or prompt_lengths.shape != clean_lengths.shape
-    ):
-        raise ValueError(
-            "Asymmetric semi-AR attention metadata tensors must have matching shapes"
-        )
-
-    full_seq_len = noisy_length + clean_length
 
     def asymmetric_semi_ar_mask(b, h, q_idx, kv_idx):
         del h
@@ -343,7 +339,60 @@ def compute_asymmetric_semi_ar_mask(
         invalid_query_self = (~valid_query) & (q_idx == kv_idx)
         return noisy_query | clean_causal | invalid_query_self
 
-    mask_mod = asymmetric_semi_ar_mask
+    return asymmetric_semi_ar_mask
+
+
+def _validate_asymmetric_semi_ar_metadata(prompt_lengths, noisy_valid_lengths, clean_lengths):
+    """Shape-check the per-sample metadata shared by the asymmetric semi-AR masks."""
+    if (
+        prompt_lengths.ndim != 1
+        or noisy_valid_lengths.ndim != 1
+        or clean_lengths.ndim != 1
+    ):
+        raise ValueError(
+            "prompt_lengths, noisy_valid_lengths, and clean_lengths must be 1D tensors"
+        )
+    if (
+        prompt_lengths.shape != noisy_valid_lengths.shape
+        or prompt_lengths.shape != clean_lengths.shape
+    ):
+        raise ValueError(
+            "Asymmetric semi-AR attention metadata tensors must have matching shapes"
+        )
+
+
+def compute_asymmetric_semi_ar_mask(
+    block_size,
+    noisy_length,
+    clean_length,
+    noisy_response_offset,
+    prompt_lengths,
+    noisy_valid_lengths,
+    clean_lengths,
+    cp_rank=0,
+    cp_size=1,
+):
+    """Compute compact asymmetric semi-AR attention mask.
+
+    See :func:`asymmetric_semi_ar_mask_mod` for the mask semantics.
+
+    With ``cp_size > 1`` the mask is built for local-Q context parallelism:
+    query rows are this rank's zigzag shard of the sequence (``Q_LEN =
+    full_seq_len / cp_size``, indices remapped to global positions) while KV
+    columns span the full gathered sequence.
+    """
+    _validate_asymmetric_semi_ar_metadata(prompt_lengths, noisy_valid_lengths, clean_lengths)
+
+    full_seq_len = noisy_length + clean_length
+    mask_mod = asymmetric_semi_ar_mask_mod(
+        block_size,
+        noisy_length,
+        noisy_response_offset,
+        prompt_lengths,
+        noisy_valid_lengths,
+        clean_lengths,
+    )
+    global_mask_mod = mask_mod
     q_len = full_seq_len
     if cp_size > 1:
         assert full_seq_len % (2 * cp_size) == 0, (
@@ -352,7 +401,7 @@ def compute_asymmetric_semi_ar_mask(
         q_len = full_seq_len // cp_size
 
         def cp_local_q_mask(b, h, q_idx, kv_idx):
-            return asymmetric_semi_ar_mask(
+            return global_mask_mod(
                 b, h, zigzag_local_to_global_idx(q_idx, cp_rank, cp_size, q_len), kv_idx
             )
 
@@ -364,6 +413,130 @@ def compute_asymmetric_semi_ar_mask(
         H=None,
         Q_LEN=q_len,
         KV_LEN=full_seq_len,
+        device=prompt_lengths.device,
+    )
+
+
+def compute_asymmetric_semi_ar_block_aware_mask(
+    block_size,
+    noisy_length,
+    clean_length,
+    noisy_response_offset,
+    prompt_lengths,
+    noisy_valid_lengths,
+    clean_lengths,
+    cp_rank=0,
+    cp_size=1,
+):
+    """Compute the asymmetric semi-AR mask for BLOCK-AWARE context parallelism.
+
+    Stage (b) of ``plans/cp_kv_sharding_blockaware_ring.md``. The noisy and
+    clean sections carry one zigzag each and only the CLEAN K/V is
+    all-gathered; the noisy K/V stays on its owning rank. That is exact, not an
+    approximation: noisy keys are only ever consumed block-diagonally, so with
+    a block-aligned noisy chunk grid every noisy key a rank's queries can reach
+    is already local.
+
+    Local layouts (per rank, with ``N = noisy_length``, ``C = clean_length``)::
+
+        queries: [ noisy zigzag (N/cp) | clean zigzag (C/cp) ]
+        keys:    [ noisy zigzag (N/cp) | clean FULL     (C)  ]
+
+    so ``Q_LEN = (N + C)/cp`` and ``KV_LEN = N/cp + C``, against local-Q CP's
+    ``KV_LEN = N + C``.
+
+    Args:
+        block_size: Noisy block size.
+        noisy_length: Full length of the noisy section.
+        clean_length: Full length of the clean section.
+        noisy_response_offset: Column where the response starts in the noisy
+            section; must be block-aligned so the chunk and block grids agree.
+        prompt_lengths: Per-sample prompt length within the clean section.
+        noisy_valid_lengths: Per-sample valid extent of the noisy section.
+        clean_lengths: Per-sample valid extent of the clean section.
+        cp_rank: This rank's index within the CP group.
+        cp_size: CP world size.
+
+    Returns:
+        BlockMask with local query rows and ``[noisy local | clean full]`` KV
+        columns.
+    """
+    _validate_asymmetric_semi_ar_metadata(prompt_lengths, noisy_valid_lengths, clean_lengths)
+
+    global_mask_mod = asymmetric_semi_ar_mask_mod(
+        block_size,
+        noisy_length,
+        noisy_response_offset,
+        prompt_lengths,
+        noisy_valid_lengths,
+        clean_lengths,
+    )
+    if cp_size == 1:
+        return _build_block_mask(
+            global_mask_mod,
+            B=prompt_lengths.shape[0],
+            H=None,
+            Q_LEN=noisy_length + clean_length,
+            KV_LEN=noisy_length + clean_length,
+            device=prompt_lengths.device,
+        )
+
+    # Segment-aware divisibility: each segment is zigzagged on its own, and the
+    # noisy chunk grid must additionally be block-aligned or a rank's queries
+    # would need noisy keys owned by another rank. Pad per segment in the batch
+    # builder (see the plan's section 2.4), not once over the whole sequence.
+    assert noisy_length % (2 * cp_size) == 0, (
+        f"block-aware CP: noisy_length {noisy_length} not divisible by 2*cp_size "
+        f"{2 * cp_size}; pad the noisy segment to a multiple of 2*cp_size*block_size"
+    )
+    assert clean_length % (2 * cp_size) == 0, (
+        f"block-aware CP: clean_length {clean_length} not divisible by 2*cp_size "
+        f"{2 * cp_size}; pad the clean segment to a multiple of 2*cp_size"
+    )
+    noisy_chunk = noisy_length // (2 * cp_size)
+    assert noisy_chunk % block_size == 0, (
+        f"block-aware CP: noisy chunk size {noisy_chunk} (= noisy_length {noisy_length} / "
+        f"(2*cp_size {2 * cp_size})) is not a multiple of block_size {block_size}; noisy K/V "
+        f"locality requires block-aligned chunks -- pad noisy_length to a multiple of "
+        f"{2 * cp_size * block_size} or lower cp_size"
+    )
+    assert noisy_response_offset % block_size == 0, (
+        f"block-aware CP: noisy_response_offset {noisy_response_offset} is not a multiple of "
+        f"block_size {block_size}; the noisy block grid is anchored at the offset, so an "
+        f"unaligned anchor straddles chunk boundaries"
+    )
+
+    noisy_local = noisy_length // cp_size
+    clean_local = clean_length // cp_size
+    device = prompt_lengths.device
+
+    # Precompute the local -> global index maps so the mask_mod is two gathers
+    # and nothing else: no Python loop, no branch, no per-element arithmetic.
+    # This matters because a mask_mod is not build-time-only -- flex lowers it
+    # into the attention Triton kernel and re-evaluates it on every partial
+    # block -- and a 1-D gather is the one indexing pattern that path already
+    # relies on (``prompt_lengths[b]``).
+    q_to_global = segmented_zigzag_index_table(
+        (noisy_length, clean_length), cp_rank, cp_size, device
+    )
+    # KV columns are this rank's noisy zigzag chunks followed by the FULL clean
+    # side: the noisy K/V is never gathered, which is the whole point of (b).
+    kv_to_global = torch.cat(
+        [
+            segmented_zigzag_index_table((noisy_length,), cp_rank, cp_size, device),
+            torch.arange(noisy_length, noisy_length + clean_length, device=device),
+        ]
+    )
+
+    def block_aware_mask(b, h, q_idx, kv_idx):
+        return global_mask_mod(b, h, q_to_global[q_idx], kv_to_global[kv_idx])
+
+    return _build_block_mask(
+        block_aware_mask,
+        B=prompt_lengths.shape[0],
+        H=None,
+        Q_LEN=noisy_local + clean_local,
+        KV_LEN=noisy_local + clean_length,
         device=prompt_lengths.device,
     )
 

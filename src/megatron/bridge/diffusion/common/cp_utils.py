@@ -248,3 +248,149 @@ def local_zigzag_mask(seq_len: int, cp_rank: int, cp_size: int, device) -> torch
     for idx in (cp_rank, 2 * cp_size - 1 - cp_rank):
         mask[idx * cs : (idx + 1) * cs] = True
     return mask
+
+
+# ---------------------------------------------------------------------------
+# Segment-aware (block-aware) sharding
+#
+# Stage (b) of plans/cp_kv_sharding_blockaware_ring.md splits the sequence into
+# independently-zigzagged SEGMENTS (e.g. [noisy | clean], or [noisy | prompt |
+# clean_response]) instead of one global zigzag. Each segment then gets the
+# treatment its cost structure wants -- the noisy segment stays rank-local
+# because it is only ever consumed block-diagonally, while the clean segment is
+# gathered (b) or ringed (c). The helpers below are the layout primitives; the
+# mask remap that consumes them lives in ``dllm``.
+# ---------------------------------------------------------------------------
+
+
+def segmented_zigzag_slice(tensor, segment_lengths, cp_rank: int, cp_size: int, seq_dim: int):
+    """Zigzag-shard each segment of a concatenated sequence independently.
+
+    The local layout is the concatenation, in segment order, of each segment's
+    own zigzag slice: ``[seg0_local | seg1_local | ...]`` with
+    ``len(seg_i_local) == segment_lengths[i] / cp_size``.
+
+    Args:
+        tensor: Full-sequence tensor; ``tensor.shape[seq_dim]`` must equal
+            ``sum(segment_lengths)``.
+        segment_lengths: Per-segment full lengths, in layout order.
+        cp_rank: This rank's index within the CP group.
+        cp_size: CP world size.
+        seq_dim: Dimension to slice.
+
+    Returns:
+        Local shard of length ``sum(segment_lengths) / cp_size``.
+    """
+    if cp_size == 1:
+        return tensor
+    total = sum(segment_lengths)
+    assert tensor.shape[seq_dim] == total, (
+        f"segmented_zigzag_slice: tensor length {tensor.shape[seq_dim]} along dim {seq_dim} "
+        f"does not match sum(segment_lengths)={total}"
+    )
+    parts = []
+    offset = 0
+    for seg_len in segment_lengths:
+        segment = tensor.narrow(seq_dim, offset, seg_len)
+        parts.append(zigzag_slice(segment, cp_rank, cp_size, seq_dim))
+        offset += seg_len
+    return torch.cat(parts, dim=seq_dim).contiguous()
+
+
+def segmented_zigzag_local_to_global_idx(
+    local_idx: torch.Tensor, segment_lengths, cp_rank: int, cp_size: int
+) -> torch.Tensor:
+    """Map positions in the segmented local layout to global sequence positions.
+
+    Index-space inverse of :func:`segmented_zigzag_slice`, and the independent
+    arithmetic definition of the layout that :func:`segmented_zigzag_slice`
+    defines in data space (the parity suite cross-checks the two).
+
+    The loop over segments runs at BUILD time only: consumers that need this
+    map inside a compiled kernel go through
+    :func:`segmented_zigzag_index_table`, which collapses it to one gather.
+    Identity when ``cp_size == 1``.
+
+    Args:
+        local_idx: Positions in ``[0, sum(segment_lengths) / cp_size)``.
+        segment_lengths: Per-segment full lengths, in layout order.
+        cp_rank: This rank's index within the CP group.
+        cp_size: CP world size.
+
+    Returns:
+        Global positions in ``[0, sum(segment_lengths))``.
+    """
+    if cp_size == 1:
+        return local_idx
+    global_idx = torch.zeros_like(local_idx)
+    local_offset = 0
+    global_offset = 0
+    for seg_len in segment_lengths:
+        local_len = seg_len // cp_size
+        in_segment = (local_idx >= local_offset) & (local_idx < local_offset + local_len)
+        mapped = global_offset + zigzag_local_to_global_idx(
+            local_idx - local_offset, cp_rank, cp_size, local_len
+        )
+        global_idx = torch.where(in_segment, mapped, global_idx)
+        local_offset += local_len
+        global_offset += seg_len
+    return global_idx
+
+
+def reorder_segmented_zigzag_shards(shards, segment_lengths, cp_size: int, seq_dim: int):
+    """Reassemble the full sequence from every rank's segmented local shard.
+
+    Data-space inverse of :func:`segmented_zigzag_slice`, and the reordering
+    step a segmented all-gather would perform after its collective (the
+    single-segment analogue is ``_reorder_zigzag_chunks``).
+
+    Args:
+        shards: Per-rank local shards, indexed by CP rank.
+        segment_lengths: Per-segment full lengths, in layout order.
+        cp_size: CP world size.
+        seq_dim: Sequence dimension.
+
+    Returns:
+        Full-sequence tensor of length ``sum(segment_lengths)``.
+    """
+    if cp_size == 1:
+        return shards[0]
+    segments = []
+    local_offset = 0
+    for seg_len in segment_lengths:
+        local_len = seg_len // cp_size
+        per_rank = [shard.narrow(seq_dim, local_offset, local_len) for shard in shards]
+        segments.append(_reorder_zigzag_chunks(per_rank, cp_size, seq_dim))
+        local_offset += local_len
+    return torch.cat(segments, dim=seq_dim).contiguous()
+
+
+def segmented_zigzag_index_table(
+    segment_lengths, cp_rank: int, cp_size: int, device=None, dtype=torch.long
+) -> torch.Tensor:
+    """Materialize the local -> global index map as a 1-D lookup table.
+
+    ``table[i]`` is the global position of local position ``i``. Built once per
+    mask construction so that a consumer running INSIDE a compiled kernel -- a
+    flex-attention ``mask_mod``, which is lowered into the attention Triton
+    kernel and re-evaluated on every partial block, not just at build time --
+    can remap an index with a single gather instead of re-deriving the segment
+    arithmetic per element. A 1-D gather is the indexing pattern that path
+    already relies on (``prompt_lengths[b]``).
+
+    Costs 8 bytes per local position (512 KiB at a 128K doubled sequence with
+    cp=4, against a 28 MiB BlockMask).
+
+    Args:
+        segment_lengths: Per-segment full lengths, in layout order.
+        cp_rank: This rank's index within the CP group.
+        cp_size: CP world size.
+        device: Device to build the table on.
+        dtype: Integer dtype of the table.
+
+    Returns:
+        ``[sum(segment_lengths) / cp_size]`` tensor of global positions.
+    """
+    local_len = sum(segment_lengths) // cp_size
+    local_idx = torch.arange(local_len, device=device, dtype=dtype)
+    return segmented_zigzag_local_to_global_idx(local_idx, segment_lengths, cp_rank, cp_size)

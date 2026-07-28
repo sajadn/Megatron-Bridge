@@ -77,10 +77,12 @@ from megatron.bridge.diffusion.common.cp_utils import (
     all_gather_kv_seq_cp,
     all_gather_seq_cp,
     scatter_seq_cp,
+    segmented_zigzag_slice,
     zigzag_slice,
 )
 from megatron.bridge.diffusion.common.dllm import (
     compute_active_block_bidirectional_mask,
+    compute_asymmetric_semi_ar_block_aware_mask,
     compute_asymmetric_semi_ar_mask,
     compute_block_bias,
 )
@@ -121,6 +123,30 @@ _FLEX_SUPPORTS_GQA = "enable_gqa" in inspect.signature(flex_attention).parameter
 # (K/V stay full-length). Default off until parity-validated at scale.
 _CP_LOCAL_Q = os.environ.get("DIFFU_CP_LOCAL_Q", "0") == "1"
 _CP_LOCAL_Q_LOGGED = False
+
+# Stage (b) of plans/cp_kv_sharding_blockaware_ring.md. Implies local-Q and goes
+# further: the noisy and clean sections carry one zigzag each and only the CLEAN
+# K/V is all-gathered, so per-rank KV_LEN is N/cp+C instead of N+C.
+#
+# REQUIRES A MATCHING DATA PATH. The layer cannot detect the difference -- both
+# layouts arrive as [S/cp, b, ...] -- but they are not the same rows: under one
+# global zigzag rank r owns a different SET of positions than under two
+# segmented ones, which is a cross-rank difference, not a local permutation.
+# Enabling this without segment-aware sharding in data.process_microbatch (and
+# the matching logprob re-gather) silently computes attention over mismatched
+# positions. Left off by default until that lands.
+# Accept any word that is not an explicit off. A bare 1/true set through a
+# config override is coerced by OmegaConf to int/bool and then trips Ray's
+# Dict[str, str] check on runtime_env["env_vars"], so the value that reaches
+# a worker has to survive a config parser (e.g. "enable").
+_CP_BLOCK_AWARE = os.environ.get("DIFFU_CP_BLOCK_AWARE", "").lower() not in (
+    "",
+    "0",
+    "off",
+    "false",
+    "no",
+)
+_CP_BLOCK_AWARE_LOGGED = False
 _GQA_PATH_LOGGED = False
 
 # The asymmetric semi-AR BlockMask depends only on metadata that is identical
@@ -634,9 +660,18 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         cp_size = self.cp_size
         cp_group = parallel_state.get_context_parallel_group() if cp_size > 1 else None
         cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
-        local_q = cp_size > 1 and _CP_LOCAL_Q
-        global _CP_LOCAL_Q_LOGGED
-        if local_q and not _CP_LOCAL_Q_LOGGED:
+        block_aware = cp_size > 1 and _CP_BLOCK_AWARE
+        local_q = cp_size > 1 and (_CP_LOCAL_Q or block_aware)
+        noisy_local_len = noisy_length // cp_size
+        global _CP_LOCAL_Q_LOGGED, _CP_BLOCK_AWARE_LOGGED
+        if block_aware and not _CP_BLOCK_AWARE_LOGGED:
+            _CP_BLOCK_AWARE_LOGGED = True
+            print(
+                "[NemotronLabsDiffusionAttention] DIFFU_CP_BLOCK_AWARE=1: "
+                "block-aware CP active (clean-only K/V gather, noisy K/V local)",
+                flush=True,
+            )
+        elif local_q and not block_aware and not _CP_LOCAL_Q_LOGGED:
             _CP_LOCAL_Q_LOGGED = True
             print(
                 "[NemotronLabsDiffusionAttention] DIFFU_CP_LOCAL_Q=1: "
@@ -644,7 +679,29 @@ class NemotronLabsDiffusionAttention(MegatronModule):
                 flush=True,
             )
         if cp_size > 1:
-            if local_q:
+            if block_aware:
+                # Gather the CLEAN section only. The noisy K/V never leaves its
+                # owning rank: noisy keys are consumed block-diagonally, so with
+                # a block-aligned noisy chunk grid every noisy key this rank's
+                # queries can reach is already here. Its grad is therefore
+                # complete under plain local autograd -- no reduction -- while
+                # the gathered clean grad is partial and the gather's backward
+                # all-reduces it.
+                key = torch.cat(
+                    [
+                        key[:noisy_local_len],
+                        all_gather_kv_seq_cp(key[noisy_local_len:], cp_group, seq_dim=0),
+                    ],
+                    dim=0,
+                )
+                value = torch.cat(
+                    [
+                        value[:noisy_local_len],
+                        all_gather_kv_seq_cp(value[noisy_local_len:], cp_group, seq_dim=0),
+                    ],
+                    dim=0,
+                )
+            elif local_q:
                 key = all_gather_kv_seq_cp(key, cp_group, seq_dim=0)
                 value = all_gather_kv_seq_cp(value, cp_group, seq_dim=0)
             else:
@@ -652,10 +709,11 @@ class NemotronLabsDiffusionAttention(MegatronModule):
                 key = all_gather_seq_cp(key, cp_group, seq_dim=0)
                 value = all_gather_seq_cp(value, cp_group, seq_dim=0)
         expected_q_len = full_seq_len // cp_size if local_q else full_seq_len
-        if query.shape[0] != expected_q_len or key.shape[0] != full_seq_len:
+        expected_kv_len = noisy_local_len + clean_length if block_aware else full_seq_len
+        if query.shape[0] != expected_q_len or key.shape[0] != expected_kv_len:
             raise ValueError(
                 f"Asymmetric semi-AR attention expected q/kv sequence lengths "
-                f"{expected_q_len}/{full_seq_len}, got {query.shape[0]}/{key.shape[0]}"
+                f"{expected_q_len}/{expected_kv_len}, got {query.shape[0]}/{key.shape[0]}"
             )
 
         batch_size = query.shape[1]
@@ -681,7 +739,29 @@ class NemotronLabsDiffusionAttention(MegatronModule):
 
         clean_position_ids = torch.arange(clean_length, device=query.device).unsqueeze(0).expand(batch_size, -1)
 
-        if local_q:
+        if block_aware:
+            # Both Q and K need their OWN segmented position ids here. Q rows are
+            # [noisy zigzag | clean zigzag] -- not a slice of one global zigzag --
+            # and K rows are [noisy zigzag local | clean FULL], so K is not
+            # full-length on the noisy side either. Reusing position_ids_full for
+            # K (as the local-Q branch below does) would rotate K's noisy half at
+            # the wrong positions: masked-out and silently wrong, not a crash.
+            position_ids_full = torch.cat([noisy_position_ids, clean_position_ids], dim=1)
+            q_position_ids = segmented_zigzag_slice(
+                position_ids_full, (noisy_length, clean_length), cp_rank, cp_size, seq_dim=1
+            )
+            k_position_ids = torch.cat(
+                [
+                    zigzag_slice(noisy_position_ids, cp_rank, cp_size, seq_dim=1),
+                    clean_position_ids,
+                ],
+                dim=1,
+            )
+            cos_k, sin_k = self.rope_embedding_module(key, k_position_ids)
+            key = apply_rotary_pos_emb_single(key, cos_k, sin_k)
+            cos_q, sin_q = self.rope_embedding_module(query, q_position_ids)
+            query = apply_rotary_pos_emb_single(query, cos_q, sin_q)
+        elif local_q:
             # RoPE is elementwise per position, so the per-half application below
             # is equivalent to one pass with the concatenated position ids. K is
             # full-length; Q uses this rank's zigzag slice of the position ids.
@@ -736,7 +816,12 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         global _CURRENT_MASK, _MASK_BUILD_COUNT
         block_mask = _CURRENT_MASK
         if block_mask is None:
-            block_mask = compute_asymmetric_semi_ar_mask(
+            build_mask = (
+                compute_asymmetric_semi_ar_block_aware_mask
+                if block_aware
+                else compute_asymmetric_semi_ar_mask
+            )
+            block_mask = build_mask(
                 block_size=self.block_size,
                 noisy_length=noisy_length,
                 clean_length=clean_length,
