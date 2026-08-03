@@ -97,6 +97,19 @@ from megatron.bridge.diffusion.common.dllm import (
 # Override via env DIFFU_FLEX_COMPILE_MODE (e.g. "default" to disable autotune).
 _FLEX_COMPILE_MODE = os.environ.get("DIFFU_FLEX_COMPILE_MODE", "max-autotune-no-cudagraphs")
 
+# flex_attention compile dynamic flag (env-gated). Default False preserves the original
+# per-shape specialization. DIFFU_FLEX_COMPILE_DYNAMIC=1 -> one shape-general kernel across
+# sequence lengths (fewer compiles, targets the multi-length recompile cost); "auto"/"none"
+# -> None (let Inductor decide). Value must be a STRING (Ray runtime_env Dict[str,str]).
+_v_dyn = os.environ.get("DIFFU_FLEX_COMPILE_DYNAMIC", "0").strip().lower()
+# Hydra/OmegaConf coerces bare 1->int and true->bool (Ray runtime_env needs str), so pass a
+# non-literal string like "yes" for True. auto/none -> None (Inductor decides); falsy -> False.
+_FLEX_COMPILE_DYNAMIC = (
+    None if _v_dyn in ("auto", "none")
+    else False if _v_dyn in ("", "0", "false", "off", "no")
+    else True
+)
+
 # Native grouped-query attention in flex (query heads broadcast onto fewer KV
 # heads inside the kernel) -- present in torch >= 2.10. When available, K/V are
 # fed at GQA width instead of materializing repeat_kv copies.
@@ -147,7 +160,7 @@ _MASK_BUILD_COUNT = 0
 _MASK_SHAPES = set()
 
 
-@torch.compile(fullgraph=True, mode=_FLEX_COMPILE_MODE, dynamic=False)
+@torch.compile(fullgraph=True, mode=_FLEX_COMPILE_MODE, dynamic=_FLEX_COMPILE_DYNAMIC)
 def fused_flex_attention(q, k, v, score_mod=None, block_mask=None, return_lse=False, enable_gqa=False):
     """Thin compiled wrapper around flex_attention."""
     return flex_attention(
