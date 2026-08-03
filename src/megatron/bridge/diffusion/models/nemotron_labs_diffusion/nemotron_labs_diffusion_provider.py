@@ -34,6 +34,13 @@ class NemotronLabsDiffusionModelProvider(Ministral3ModelProvider):
     dlm_loss_weight: float = 0.3
     ar_loss_weight: float = 1.0
     position_embedding_type: str = "none"
+    # Text-only model: Ministral3ModelProvider sets this False because its VL wrapper
+    # calls language_model.embedding() itself, splices image features in, then scatters
+    # by hand (modeling_ministral3.py:271). This provider calls provide_language_model()
+    # and never runs that wrapper, so LanguageModelEmbedding IS the live code path --
+    # inheriting False leaves the embedding unscattered under sequence_parallel=True and
+    # linear_qkv then all-gathers to tp_size * seq_len. Restore the GPT default.
+    scatter_embedding_sequence_parallel: bool = True
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None):
         transformer_layer_spec = self.transformer_layer_spec
