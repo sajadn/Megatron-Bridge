@@ -366,9 +366,15 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         hf_text_config = getattr(config.hf_config, "text_config", config.hf_config)
         rope_parameters = hf_text_config.rope_parameters
         hf_text_config.max_position_embeddings = config.seq_length
-        self.rope_embedding_module = Ministral3RotaryEmbedding(hf_text_config)
 
-        # Llama-4 style query scaling (optional)
+        # Llama-4 style query scaling (optional).
+        #
+        # MUST be settled BEFORE the rotary module is built. `rope_parameters` is
+        # a REFERENCE to a dict on the single shared `hf_config`, and the guard
+        # below stops matching once it has fired -- so building first meant layer
+        # 0 read the pre-override factor and layers 1..L-1 the post-override one.
+        # Measured on 8B v1.5-sft: layer 0 inv_freq[-1]=1.551e-07 against
+        # 7.756e-08 everywhere else, exactly the 2x its factor ratio implies.
         self.beta = None
         self.max_position_embeddings = None
         if (
@@ -383,6 +389,9 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             ):
                 rope_parameters["factor"] = config.yarn_rotary_scaling_factor
                 hf_text_config.rope_parameters["factor"] = config.yarn_rotary_scaling_factor
+
+        # Built last, so every layer sees the same already-settled parameters.
+        self.rope_embedding_module = Ministral3RotaryEmbedding(hf_text_config)
 
         # Build sbd_block_diff block masks lazily. AR forwards use inference mode
         # and should not allocate diffusion-only masks during module construction.
