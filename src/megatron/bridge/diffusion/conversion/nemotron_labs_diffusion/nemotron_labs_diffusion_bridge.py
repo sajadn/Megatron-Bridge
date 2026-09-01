@@ -63,7 +63,29 @@ class NemotronLabsDiffusionBridge(MegatronModelBridge):
         if rope_parameters is not None and "rope_scaling" not in text_config.to_dict():
             text_config.__dict__["rope_scaling"] = dict(rope_parameters)
 
+        # Forward the checkpoint's YaRN parameters. This bridge overrides
+        # provider_bridge(), so the generic YARN_ROPE_SCALING_MAPPING in
+        # model_bridge.py never runs for this model -- without these the
+        # provider silently keeps Ministral3ModelProvider's defaults
+        # (yarn_rotary_scaling_factor=16.0), which then get written back over
+        # the checkpoint's value inside the attention layer's __init__.
+        # Invisible on the 3B (its factor IS 16.0); wrong on 8B v1.5-sft (8.0).
+        yarn_kwargs = {}
+        if rope_parameters is not None and rope_parameters.get("rope_type") == "yarn":
+            for hf_key, provider_key in (
+                ("factor", "yarn_rotary_scaling_factor"),
+                ("original_max_position_embeddings", "yarn_original_max_position_embeddings"),
+                ("beta_fast", "yarn_beta_fast"),
+                ("beta_slow", "yarn_beta_slow"),
+                ("mscale", "yarn_mscale"),
+                ("mscale_all_dim", "yarn_mscale_all_dim"),
+            ):
+                v = rope_parameters.get(hf_key)
+                if v is not None:
+                    yarn_kwargs[provider_key] = v
+
         return NemotronLabsDiffusionModelProvider(
+            **yarn_kwargs,
             hidden_size=text_config.hidden_size,
             ffn_hidden_size=text_config.intermediate_size,
             num_layers=text_config.num_hidden_layers,
