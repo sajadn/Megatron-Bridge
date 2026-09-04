@@ -17,7 +17,12 @@
 import inspect
 from dataclasses import dataclass
 
-from megatron.bridge.diffusion.models.common.nemotron_labs_diffusion_attention import NemotronLabsDiffusionAttention
+import functools
+
+from megatron.bridge.diffusion.models.common.nemotron_labs_diffusion_attention import (
+    Ministral3RotaryEmbedding,
+    NemotronLabsDiffusionAttention,
+)
 from megatron.bridge.models.gpt_provider import ModuleSpec
 from megatron.bridge.models.ministral3.ministral3_provider import Ministral3ModelProvider
 
@@ -51,7 +56,26 @@ class NemotronLabsDiffusionModelProvider(Ministral3ModelProvider):
                 transformer_layer_spec = transformer_layer_spec(self)
 
         if hasattr(transformer_layer_spec, "submodules"):
-            transformer_layer_spec.submodules.self_attention.submodules.core_attention = NemotronLabsDiffusionAttention
+            # Build ONE rotary module here, at model level, and bind it into
+            # every layer -- the same shape as stock HF/Megatron, which create
+            # a single rotary_emb on the model and thread it down. Sharing it
+            # keeps the cos/sin table from being materialized L times (24 MiB
+            # per layer at a 24576 sequence) and makes it impossible for two
+            # layers to disagree on rotary parameters.
+            #
+            # Bound with functools.partial rather than through ModuleSpec
+            # params because SelfAttention calls submodules.core_attention(...)
+            # directly (megatron/core/transformer/attention.py) rather than via
+            # build_module, so spec params would be ignored. partial also keeps
+            # the shared instance out of the TransformerConfig, which that same
+            # code deep-copies when num_query_groups is not divisible by TP --
+            # a copy would silently give each layer its own module again.
+            hf_text_config = getattr(self.hf_config, "text_config", self.hf_config)
+            hf_text_config.max_position_embeddings = self.seq_length
+            rope_module = Ministral3RotaryEmbedding(hf_text_config)
+            transformer_layer_spec.submodules.self_attention.submodules.core_attention = (
+                functools.partial(NemotronLabsDiffusionAttention, rope_module=rope_module)
+            )
 
         original_spec = self.transformer_layer_spec
         self.transformer_layer_spec = transformer_layer_spec

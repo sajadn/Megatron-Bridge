@@ -178,6 +178,49 @@ _MASK_CACHE_DEBUG = os.environ.get("DIFFU_MASK_CACHE_DEBUG", "").lower() not in 
     "false",
     "no",
 )
+
+# RoPE is handled entirely inside Ministral3RotaryEmbedding, of which there is
+# ONE instance per model rather than one per layer (see the attention
+# constructor). It holds two things:
+#
+#   cos_cached / sin_cached  the source table over [0, max_seq_len), built in
+#                            __init__ so the forward is a lookup rather than a
+#                            recomputation -- the classic HF rotary pattern.
+#   metadata["rope"]         the GATHERED cos/sin for the microbatch in flight,
+#                            keyed by role ("q", "k", "full", "noisy", "clean").
+#                            Lives on the SHARED asymmetric metadata, so its
+#                            lifetime is the microbatch by construction.
+#
+# The second is what saves memory: `cos_cached[position_ids]` allocates a fresh
+# [b, seq, head_dim] tensor, and `apply_rotary_pos_emb_single` does
+# `x * cos + rotate_half(x) * sin`, whose backward needs cos and sin -- so every
+# layer that gathers separately also RETAINS separately. That is
+# `2 * (q_len + k_len) * head_dim * 2 B * (L-1)`, ~0.44 GiB for the 8B at a
+# 24576 doubled sequence.
+#
+# Roles are a sound key because within one microbatch every layer derives its
+# position ids from the same metadata plus process-constant cp_rank/cp_size.
+# Across microbatches the VALUES change at a fixed shape -- noisy ids are
+# prompt_lengths + clamp(noisy_rel) -- so the tables are dropped in
+# set/clear_asymmetric_ar_metadata.
+#
+# SCOPE: the asymmetric semi-AR forward only. The inference forward passes no
+# role and so always recomputes: KV-cache decoding advances positions every
+# step and has no microbatch boundary to scope a table to.
+
+# Diagnostic, default off, same parsing convention as DIFFU_MASK_CACHE_DEBUG
+# (pass a WORD; OmegaConf coerces a bare 1/true and Ray then rejects
+# runtime_env["env_vars"], which wants Dict[str, str]). On a hit, re-checks both
+# the position ids AND the rotary parameters the table was built from -- the
+# latter because a table is only reusable if every layer's rotary module agrees,
+# which is exactly what the yarn factor bug once violated.
+_ROPE_CACHE_DEBUG = os.environ.get("DIFFU_ROPE_CACHE_DEBUG", "").lower() not in (
+    "",
+    "0",
+    "off",
+    "false",
+    "no",
+)
 _MASK_CACHE_DEBUG_EVERY = int(os.environ.get("DIFFU_MASK_CACHE_DEBUG_EVERY", "25"))
 _MASK_BUILD_COUNT = 0
 # Distinct (Q_LEN, KV_LEN) pairs seen. Sequence length varies per microbatch
@@ -266,6 +309,18 @@ class Ministral3RotaryEmbedding(nn.Module):
         # Keep a non-buffer fp32 copy: model dtype casts convert buffers to bf16.
         self.original_inv_freq = inv_freq.detach().clone().to(dtype=torch.float32)
 
+        # Precompute cos/sin for positions [0, max_seq_len_cached) once, here,
+        # instead of rebuilding them from inv_freq on every forward. This is the
+        # classic HF rotary pattern (`_set_cos_sin_cache` in __init__, forward
+        # is a lookup) that `max_seq_len_cached` above is a leftover of.
+        #
+        # `config.max_position_embeddings` is set to the model's seq_length by
+        # the caller just before this module is constructed, so the table is
+        # sized to the sequence actually being run, not to the checkpoint's
+        # 131K/262K ceiling: 24576 positions x 128 dims x fp32 x (cos, sin) =
+        # 24 MiB. Non-persistent, so it stays out of the checkpoint.
+        self._build_cos_sin_cache(device=inv_freq.device)
+
     @staticmethod
     def _compute_default_rope_parameters(config=None, device=None, seq_len=None):
         base = config.rope_parameters["rope_theta"]
@@ -276,21 +331,66 @@ class Ministral3RotaryEmbedding(nn.Module):
         return inv_freq, 1.0
 
     @torch.no_grad()
-    def forward(self, x, position_ids):
-        inv_freq = getattr(self, "original_inv_freq", self.inv_freq)
-        inv_freq_expanded = (
-            inv_freq[None, :, None].to(device=x.device, dtype=torch.float32).expand(position_ids.shape[0], -1, 1)
+    def _build_cos_sin_cache(self, device=None, seq_len=None):
+        """Materialize cos/sin for ``[0, seq_len)`` as non-persistent buffers."""
+        seq_len = int(seq_len or self.max_seq_len_cached)
+        inv_freq = getattr(self, "original_inv_freq", self.inv_freq).to(
+            device=device, dtype=torch.float32
         )
-        position_ids_expanded = position_ids[:, None, :].float()
+        t = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos() * self.attention_scaling, persistent=False)
+        self.register_buffer("sin_cached", emb.sin() * self.attention_scaling, persistent=False)
+        self.max_seq_len_cached = seq_len
+        # Remember where the trig actually RAN, not where the tensor now lives.
+        # `.to(device)` moves the buffer without recomputing it, and CPU and CUDA
+        # transcendentals differ by ~6e-8 in fp32 -- invisible after the bf16
+        # round except for values sitting within half an ULP of a bf16 midpoint,
+        # where it flips the result by a full ULP (measured: 2 of 131072 entries
+        # at the 8B's yarn frequencies). Rebuilding when the compute device
+        # changes keeps this bit-identical to computing in the forward.
+        self._cache_device = torch.device(inv_freq.device)
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
+    @torch.no_grad()
+    def forward(self, x, position_ids, role=None, cache=None):
+        """cos/sin for ``position_ids``; reused across layers via ``cache``.
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        ``cache`` is the per-microbatch dict carried on the shared asymmetric
+        metadata, so the first layer to ask for a role computes and the rest
+        read. This module holds no per-microbatch state of its own: a new
+        microbatch brings a new metadata dict and therefore a new, empty cache,
+        which is the entire invalidation story. Called without a cache -- the
+        inference path -- it always recomputes.
+        """
+        if cache is not None and role is not None:
+            hit = cache.get(role)
+            if hit is not None:
+                cos, sin, cached_ids = hit
+                if _ROPE_CACHE_DEBUG and not torch.equal(cached_ids, position_ids):
+                    raise RuntimeError(
+                        f"RoPE role {role!r} reused with different position ids: "
+                        "the tables outlived their microbatch, which would rotate "
+                        "these rows at the wrong positions."
+                    )
+                return cos, sin
+
+        # Lookup, not recomputation. Grow the table only if a caller asks for a
+        # position beyond it -- the same fallback the HF pattern uses -- so an
+        # unexpectedly long sequence degrades in speed rather than indexing out
+        # of range.
+        needed = int(position_ids.max().item()) + 1
+        if (
+            needed > self.max_seq_len_cached
+            or getattr(self, "_cache_device", None) != position_ids.device
+        ):
+            self._build_cos_sin_cache(device=position_ids.device,
+                                      seq_len=max(needed, self.max_seq_len_cached))
+        cos = self.cos_cached[position_ids].to(dtype=x.dtype)
+        sin = self.sin_cached[position_ids].to(dtype=x.dtype)
+        if cache is not None and role is not None:
+            cache[role] = (cos, sin, position_ids if _ROPE_CACHE_DEBUG else None)
+        return cos, sin
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +416,7 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         softmax_scale: float = None,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
+        rope_module: Optional["Ministral3RotaryEmbedding"] = None,
     ):
         super().__init__(config=config)
         self.config = config
@@ -391,7 +492,20 @@ class NemotronLabsDiffusionAttention(MegatronModule):
                 hf_text_config.rope_parameters["factor"] = config.yarn_rotary_scaling_factor
 
         # Built last, so every layer sees the same already-settled parameters.
-        self.rope_embedding_module = Ministral3RotaryEmbedding(hf_text_config)
+        # The provider builds ONE rotary module for the whole model and binds
+        # it here, so all L layers share a single instance (see
+        # NemotronLabsDiffusionModelProvider.provide). Two consequences:
+        #   - the cos/sin table is materialized once instead of L times
+        #     (24 MiB/layer at a 24576 sequence => 0.8 GiB across 34 layers,
+        #     3.2 GiB at 16K/32K);
+        #   - every layer provably shares rotary parameters, which is exactly
+        #     what the yarn-factor divergence fixed in the preceding commits
+        #     violated.
+        # Constructed per layer when not injected, so any caller that builds
+        # this class directly -- unit tests, probes -- still works.
+        self.rope_embedding_module = (
+            rope_module if rope_module is not None else Ministral3RotaryEmbedding(hf_text_config)
+        )
 
         # Build sbd_block_diff block masks lazily. AR forwards use inference mode
         # and should not allocate diffusion-only masks during module construction.
@@ -464,8 +578,8 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             self.clear_kv_cache()
             self.clear_block_bidirectional_mask()
 
-    def set_asymmetric_ar_metadata(
-        self,
+    @staticmethod
+    def build_asymmetric_ar_metadata(
         noisy_length: int,
         clean_length: int,
         noisy_response_offset: int,
@@ -473,8 +587,13 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         response_lengths: Tensor,
         noisy_valid_lengths: Tensor,
         clean_lengths: Tensor,
-    ):
-        """Set per-sample metadata for compact asymmetric semi-AR attention."""
+    ) -> dict:
+        """Validate and build the per-microbatch metadata, once.
+
+        Build this ONCE per microbatch and hand the same object to every layer
+        via :meth:`set_asymmetric_ar_metadata`, so all L layers read one dict
+        instead of L copies of the same values.
+        """
         if (
             prompt_lengths.ndim != 1
             or response_lengths.ndim != 1
@@ -488,10 +607,11 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             or prompt_lengths.shape != clean_lengths.shape
         ):
             raise ValueError("Asymmetric semi-AR attention metadata tensors must have matching shapes")
-        # New metadata => any mask built for the previous microbatch is stale.
-        global _CURRENT_MASK
-        _CURRENT_MASK = None
-        self._asymmetric_ar_metadata = {
+        return {
+            # Per-microbatch RoPE tables, filled lazily by the first layer to
+            # need each role. A fresh metadata dict brings a fresh empty one,
+            # so there is nothing to invalidate.
+            "rope": {},
             "noisy_length": int(noisy_length),
             "clean_length": int(clean_length),
             "noisy_response_offset": int(noisy_response_offset),
@@ -500,6 +620,30 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             "noisy_valid_lengths": noisy_valid_lengths,
             "clean_lengths": clean_lengths,
         }
+
+    def set_asymmetric_ar_metadata(self, metadata: Optional[dict] = None, **fields):
+        """Point this layer at the metadata for the microbatch in flight.
+
+        Preferred form -- build once, share across layers::
+
+            meta = NemotronLabsDiffusionAttention.build_asymmetric_ar_metadata(...)
+            for layer in layers:
+                layer.set_asymmetric_ar_metadata(meta)
+
+        Passing the fields as keywords instead builds a private dict for this
+        layer. That is correct but gives every layer its own copy, so the
+        shared form is preferred wherever the caller loops over layers.
+        """
+        if metadata is None:
+            metadata = self.build_asymmetric_ar_metadata(**fields)
+        elif fields:
+            raise TypeError("pass either a prebuilt metadata dict or the individual fields, not both")
+        # New metadata => any mask built for the previous microbatch is stale.
+        # The RoPE tables need no invalidation: they ride on metadata["rope"],
+        # which is empty in every freshly built metadata dict.
+        global _CURRENT_MASK
+        _CURRENT_MASK = None
+        self._asymmetric_ar_metadata = metadata
 
     def clear_asymmetric_ar_metadata(self):
         self._asymmetric_ar_metadata = None
@@ -740,6 +884,7 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         key = key.transpose(0, 1).transpose(1, 2)
         value = value.transpose(0, 1).transpose(1, 2)
 
+        rope_cache = metadata.get("rope")
         noisy_positions = torch.arange(noisy_length, device=query.device).unsqueeze(0).expand(batch_size, -1)
         noisy_rel_positions = noisy_positions - noisy_response_offset
         noisy_valid = (noisy_rel_positions >= 0) & (noisy_rel_positions < noisy_valid_lengths.unsqueeze(1))
@@ -766,23 +911,23 @@ class NemotronLabsDiffusionAttention(MegatronModule):
                 ],
                 dim=1,
             )
-            cos_k, sin_k = self.rope_embedding_module(key, k_position_ids)
+            cos_k, sin_k = self.rope_embedding_module(key, k_position_ids, role="k", cache=rope_cache)
             key = apply_rotary_pos_emb_single(key, cos_k, sin_k)
-            cos_q, sin_q = self.rope_embedding_module(query, q_position_ids)
+            cos_q, sin_q = self.rope_embedding_module(query, q_position_ids, role="q", cache=rope_cache)
             query = apply_rotary_pos_emb_single(query, cos_q, sin_q)
         elif local_q:
             # RoPE is elementwise per position, so the per-half application below
             # is equivalent to one pass with the concatenated position ids. K is
             # full-length; Q uses this rank's zigzag slice of the position ids.
             position_ids_full = torch.cat([noisy_position_ids, clean_position_ids], dim=1)
-            cos_full, sin_full = self.rope_embedding_module(key, position_ids_full)
+            cos_full, sin_full = self.rope_embedding_module(key, position_ids_full, role="full", cache=rope_cache)
             key = apply_rotary_pos_emb_single(key, cos_full, sin_full)
             q_position_ids = zigzag_slice(position_ids_full, cp_rank, cp_size, seq_dim=1)
-            cos_q, sin_q = self.rope_embedding_module(query, q_position_ids)
+            cos_q, sin_q = self.rope_embedding_module(query, q_position_ids, role="q", cache=rope_cache)
             query = apply_rotary_pos_emb_single(query, cos_q, sin_q)
         else:
-            cos_noisy, sin_noisy = self.rope_embedding_module(query, noisy_position_ids)
-            cos_clean, sin_clean = self.rope_embedding_module(query, clean_position_ids)
+            cos_noisy, sin_noisy = self.rope_embedding_module(query, noisy_position_ids, role="noisy", cache=rope_cache)
+            cos_clean, sin_clean = self.rope_embedding_module(query, clean_position_ids, role="clean", cache=rope_cache)
 
             q_noisy = query[:, :, :noisy_length, :]
             q_clean = query[:, :, noisy_length:, :]
