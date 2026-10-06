@@ -52,10 +52,10 @@ numerically-equivalent gradients (cp=1 vs cp=2 vs cp=4) via the CP-sharding roun
 tests in ``tests/unit_tests/diffusion/common/test_cp_utils.py``.
 """
 
-import os
 import copy
 import inspect
 import math
+import os
 from typing import Optional
 
 import torch
@@ -107,9 +107,7 @@ _v_dyn = os.environ.get("DIFFU_FLEX_COMPILE_DYNAMIC", "0").strip().lower()
 # Hydra/OmegaConf coerces bare 1->int and true->bool (Ray runtime_env needs str), so pass a
 # non-literal string like "yes" for True. auto/none -> None (Inductor decides); falsy -> False.
 _FLEX_COMPILE_DYNAMIC = (
-    None if _v_dyn in ("auto", "none")
-    else False if _v_dyn in ("", "0", "false", "off", "no")
-    else True
+    None if _v_dyn in ("auto", "none") else False if _v_dyn in ("", "0", "false", "off", "no") else True
 )
 
 # Native grouped-query attention in flex (query heads broadcast onto fewer KV
@@ -334,9 +332,7 @@ class Ministral3RotaryEmbedding(nn.Module):
     def _build_cos_sin_cache(self, device=None, seq_len=None):
         """Materialize cos/sin for ``[0, seq_len)`` as non-persistent buffers."""
         seq_len = int(seq_len or self.max_seq_len_cached)
-        inv_freq = getattr(self, "original_inv_freq", self.inv_freq).to(
-            device=device, dtype=torch.float32
-        )
+        inv_freq = getattr(self, "original_inv_freq", self.inv_freq).to(device=device, dtype=torch.float32)
         t = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -379,13 +375,13 @@ class Ministral3RotaryEmbedding(nn.Module):
         # position beyond it -- the same fallback the HF pattern uses -- so an
         # unexpectedly long sequence degrades in speed rather than indexing out
         # of range.
-        needed = int(position_ids.max().item()) + 1
-        if (
-            needed > self.max_seq_len_cached
-            or getattr(self, "_cache_device", None) != position_ids.device
-        ):
-            self._build_cos_sin_cache(device=position_ids.device,
-                                      seq_len=max(needed, self.max_seq_len_cached))
+        # An empty slice -- a microbatch whose noisy block starts past the end of
+        # every sequence on this rank -- asks for no positions at all. max() has
+        # no reduction dim on an empty tensor, while indexing the table with an
+        # empty index already yields the correct empty result.
+        needed = int(position_ids.max().item()) + 1 if position_ids.numel() else 0
+        if needed > self.max_seq_len_cached or getattr(self, "_cache_device", None) != position_ids.device:
+            self._build_cos_sin_cache(device=position_ids.device, seq_len=max(needed, self.max_seq_len_cached))
         cos = self.cos_cached[position_ids].to(dtype=x.dtype)
         sin = self.sin_cached[position_ids].to(dtype=x.dtype)
         if cache is not None and role is not None:
@@ -827,8 +823,7 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         elif local_q and not block_aware and not _CP_LOCAL_Q_LOGGED:
             _CP_LOCAL_Q_LOGGED = True
             print(
-                "[NemotronLabsDiffusionAttention] DIFFU_CP_LOCAL_Q=1: "
-                "local-Q flex CP path active",
+                "[NemotronLabsDiffusionAttention] DIFFU_CP_LOCAL_Q=1: local-Q flex CP path active",
                 flush=True,
             )
         if cp_size > 1:
@@ -926,8 +921,12 @@ class NemotronLabsDiffusionAttention(MegatronModule):
             cos_q, sin_q = self.rope_embedding_module(query, q_position_ids, role="q", cache=rope_cache)
             query = apply_rotary_pos_emb_single(query, cos_q, sin_q)
         else:
-            cos_noisy, sin_noisy = self.rope_embedding_module(query, noisy_position_ids, role="noisy", cache=rope_cache)
-            cos_clean, sin_clean = self.rope_embedding_module(query, clean_position_ids, role="clean", cache=rope_cache)
+            cos_noisy, sin_noisy = self.rope_embedding_module(
+                query, noisy_position_ids, role="noisy", cache=rope_cache
+            )
+            cos_clean, sin_clean = self.rope_embedding_module(
+                query, clean_position_ids, role="clean", cache=rope_cache
+            )
 
             q_noisy = query[:, :, :noisy_length, :]
             q_clean = query[:, :, noisy_length:, :]
@@ -971,9 +970,7 @@ class NemotronLabsDiffusionAttention(MegatronModule):
         block_mask = _CURRENT_MASK
         if block_mask is None:
             build_mask = (
-                compute_asymmetric_semi_ar_block_aware_mask
-                if block_aware
-                else compute_asymmetric_semi_ar_mask
+                compute_asymmetric_semi_ar_block_aware_mask if block_aware else compute_asymmetric_semi_ar_mask
             )
             block_mask = build_mask(
                 block_size=self.block_size,
@@ -999,9 +996,7 @@ class NemotronLabsDiffusionAttention(MegatronModule):
                         flush=True,
                     )
 
-        context = fused_flex_attention(
-            query, key, value, block_mask=block_mask, enable_gqa=use_native_gqa
-        )
+        context = fused_flex_attention(query, key, value, block_mask=block_mask, enable_gqa=use_native_gqa)
 
         if not self.config.sequence_parallel:
             with tensor_parallel.get_cuda_rng_tracker().fork():
